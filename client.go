@@ -194,7 +194,7 @@ func SessionMaxLinks(n int) SessionOption {
 		if n < 1 {
 			return errorNew("max sessions cannot be less than 1")
 		}
-		if n > 4294967296 {
+		if int64(n) > 4294967296 {
 			return errorNew("max sessions cannot be greater than 4294967296")
 		}
 		s.handleMax = uint32(n - 1)
@@ -370,7 +370,7 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 	}
 
 	var (
-		maxPayloadSize = int(s.link.session.conn.peerMaxFrameSize) - maxTransferFrameHeader
+		maxPayloadSize = int64(s.link.session.conn.peerMaxFrameSize) - maxTransferFrameHeader
 		sndSettleMode  = s.link.senderSettleMode
 		rcvSettleMode  = s.link.receiverSettleMode
 		senderSettled  = sndSettleMode != nil && *sndSettleMode == ModeSettled
