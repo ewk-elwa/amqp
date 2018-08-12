@@ -774,7 +774,7 @@ type DetachError struct {
 	RemoteError *Error
 }
 
-func (e DetachError) Error() string {
+func (e *DetachError) Error() string {
 	return fmt.Sprintf("link detached, reason: %+v", e.RemoteError)
 }
 
@@ -1198,7 +1198,7 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 		// set detach received and close link
 		l.detachReceived = true
 
-		return errorWrapf(DetachError{fr.Error}, "received detach frame")
+		return errorWrapf(&DetachError{fr.Error}, "received detach frame")
 
 	case *performDisposition:
 		debug(3, "RX: %s", fr)
@@ -1307,13 +1307,24 @@ func (l *link) muxDetach() {
 		Closed: true,
 		Error:  detachError,
 	}
-	select {
-	case l.session.tx <- fr:
-	case <-l.session.done:
-		if l.err == nil {
-			l.err = l.session.err
+
+Loop:
+	for {
+		select {
+		case l.session.tx <- fr:
+			// after sending the detach frame, break the read loop
+			break Loop
+		case fr := <-l.rx:
+			// discard incoming frames to avoid blocking session.mux
+			if fr, ok := fr.(*performDetach); ok && fr.Closed {
+				l.detachReceived = true
+			}
+		case <-l.session.done:
+			if l.err == nil {
+				l.err = l.session.err
+			}
+			return
 		}
-		return
 	}
 
 	// don't wait for remote to detach when already
@@ -1547,6 +1558,17 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 		case r.link.receiverReady <- struct{}{}:
 		default:
 		}
+	}
+
+	// non-blocking receive to ensure buffered messages are
+	// delivered regardless of whether the link has been closed.
+	select {
+	case msg := <-r.link.messages:
+		msg.receiver = r
+		return &msg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 
 	// wait for the next message
