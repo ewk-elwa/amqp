@@ -378,7 +378,7 @@ func (c *amqpConnection) mux() {
 			}
 
 			select {
-			case session.rx <- fr:
+			case session.inFrameChan <- fr:
 			case <-c.closeMux:
 				return
 			}

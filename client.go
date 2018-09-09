@@ -146,7 +146,7 @@ func (theClient *Client) NewSession(opts ...SessionOption) (*Session, error) {
 	select {
 	case <-theClient.amqpConn.done:
 		return nil, theClient.amqpConn.getErr()
-	case myRxFrame = <-mySession.rx:
+	case myRxFrame = <-mySession.inFrameChan:
 	}
 	debug(1, "RX: %s", myRxFrame.body)
 
@@ -215,9 +215,9 @@ type Session struct {
 	channel           uint16                // session's local channel
 	remoteChannel     uint16                // session's remote channel, owned by conn.mux
 	theAmqpConnection *amqpConnection       // underlying conn
-	rx                chan frame            // frames destined for this session are sent on this chan by conn.mux
-	tx                chan frameBody        // non-transfer frames to be sent; session must track disposition
-	txTransfer        chan *performTransfer // transfer frames to be sent; session must track disposition
+	inFrameChan       chan frame            // frames destined for this session are sent on this chan by conn.mux
+	outSvrFrameChan   chan frameBody        // non-transfer frames to be sent; session must track disposition
+	outDataFrameChan  chan *performTransfer // transfer frames to be sent; session must track disposition
 
 	// flow control
 	incomingWindow uint32
@@ -240,9 +240,9 @@ func newSession(theAmqpConnection *amqpConnection, channel uint16) *Session {
 	return &Session{
 		theAmqpConnection: theAmqpConnection,
 		channel:           channel,
-		rx:                make(chan frame),
-		tx:                make(chan frameBody),
-		txTransfer:        make(chan *performTransfer),
+		inFrameChan:       make(chan frame),
+		outSvrFrameChan:   make(chan frameBody),
+		outDataFrameChan:  make(chan *performTransfer),
 		incomingWindow:    DefaultWindow,
 		outgoingWindow:    DefaultWindow,
 		handleMax:         DefaultMaxLinks - 1,
@@ -414,7 +414,7 @@ func (theSender *Sender) send(ctx context.Context, msg *Message) (chan deliveryS
 		}
 
 		select {
-		case theSender.link.transfers <- fr:
+		case theSender.link.outTransferFrameChan <- fr:
 		case <-theSender.link.done:
 			return nil, theSender.link.err
 		case <-ctx.Done():
@@ -480,7 +480,7 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 	}
 
 	for {
-		txTransfer := theSender.txTransfer
+		txTransfer := theSender.outDataFrameChan
 		// disable txTransfer if flow control windows have been exceeded
 		if remoteIncomingWindow == 0 || theSender.outgoingWindow == 0 {
 			txTransfer = nil
@@ -500,7 +500,7 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 		EndLoop:
 			for {
 				select {
-				case inFrame := <-theSender.rx:
+				case inFrame := <-theSender.inFrameChan:
 					_, ok := inFrame.body.(*performEnd)
 					if ok {
 						break EndLoop
@@ -525,23 +525,23 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 			next, ok := handles.next()
 			if !ok {
 				senderLink.err = errorErrorf("reached session handle max (%d)", theSender.handleMax)
-				senderLink.rx <- nil
+				senderLink.inFrameChan <- nil
 				continue
 			}
 
 			senderLink.handle = next                  // allocate handle to the link
 			linksByName[senderLink.name] = senderLink // add to mapping
-			senderLink.rx <- nil                      // send nil on channel to indicate allocation complete
+			senderLink.inFrameChan <- nil             // send nil on channel to indicate allocation complete
 
 		// handle deallocation request
 		case senderLink := <-theSender.deallocateHandle:
 			delete(links, senderLink.remoteHandle)
 			delete(deliveryIDByHandle, senderLink.handle)
 			handles.remove(senderLink.handle)
-			close(senderLink.rx) // close channel to indicate deallocation
+			close(senderLink.inFrameChan) // close channel to indicate deallocation
 
 		// incoming frame for link
-		case inFrame := <-theSender.rx:
+		case inFrame := <-theSender.inFrameChan:
 			debug(1, "RX(Session): %s", inFrame.body)
 
 			switch body := inFrame.body.(type) {
@@ -672,7 +672,7 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 
 				select {
 				case <-theSender.theAmqpConnection.done:
-				case link.rx <- inFrame.body:
+				case link.inFrameChan <- inFrame.body:
 				}
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
@@ -749,7 +749,7 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 			nextOutgoingID++
 			remoteIncomingWindow--
 
-		case fr := <-theSender.tx:
+		case fr := <-theSender.outSvrFrameChan:
 			switch fr := fr.(type) {
 			case *performFlow:
 				niID := nextIncomingID
@@ -772,7 +772,7 @@ func (theSender *Session) mux(remoteBegin *performBegin) {
 
 func (theSession *Session) muxFrameToLink(theLink *link, theFrameBody frameBody) {
 	select {
-	case theLink.rx <- theFrameBody:
+	case theLink.inFrameChan <- theFrameBody:
 	case <-theLink.done:
 	case <-theSession.theAmqpConnection.done:
 	}
@@ -800,22 +800,22 @@ const (
 //
 // May be used for sending or receiving.
 type link struct {
-	name          string               // our name
-	handle        uint32               // our handle
-	remoteHandle  uint32               // remote's handle
-	dynamicAddr   bool                 // request a dynamic link address from the server
-	rx            chan frameBody       // sessions sends frames for this link on this channel
-	transfers     chan performTransfer // sender uses to send transfer frames
-	closeOnce     sync.Once            // closeOnce protects close from being closed multiple times
-	close         chan struct{}        // close signals the mux to shutdown
-	done          chan struct{}        // done is closed by mux/muxDetach when the link is fully detached
-	detachErrorMu sync.Mutex           // protects detachError
-	detachError   *Error               // error to send to remote on detach, set by closeWithError
-	session       *Session             // parent session
-	receiver      *Receiver            // allows link options to modify Receiver
-	source        *source
-	target        *target
-	properties    map[symbol]interface{} // additional properties sent upon link attach
+	name                 string               // our name
+	handle               uint32               // our handle
+	remoteHandle         uint32               // remote's handle
+	dynamicAddr          bool                 // request a dynamic link address from the server
+	inFrameChan          chan frameBody       // sessions sends frames for this link on this channel
+	outTransferFrameChan chan performTransfer // sender uses to send transfer frames
+	closeOnce            sync.Once            // closeOnce protects close from being closed multiple times
+	close                chan struct{}        // close signals the mux to shutdown
+	done                 chan struct{}        // done is closed by mux/muxDetach when the link is fully detached
+	detachErrorMu        sync.Mutex           // protects detachError
+	detachError          *Error               // error to send to remote on detach, set by closeWithError
+	session              *Session             // parent session
+	receiver             *Receiver            // allows link options to modify Receiver
+	source               *source
+	target               *target
+	properties           map[symbol]interface{} // additional properties sent upon link attach
 
 	// "The delivery-count is initialized by the sender when a link endpoint is created,
 	// and is incremented whenever a message is sent. Only the sender MAY independently
@@ -852,9 +852,9 @@ func attachLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (
 	// buffer rx to linkCredit so that conn.mux won't block
 	// attempting to send to a slow reader
 	if isReceiver {
-		mySessionLink.rx = make(chan frameBody, mySessionLink.linkCredit)
+		mySessionLink.inFrameChan = make(chan frameBody, mySessionLink.linkCredit)
 	} else {
-		mySessionLink.rx = make(chan frameBody, 1)
+		mySessionLink.inFrameChan = make(chan frameBody, 1)
 	}
 
 	// request handle from Session.mux
@@ -868,7 +868,7 @@ func attachLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (
 	select {
 	case <-theSession.done:
 		return nil, theSession.err
-	case <-mySessionLink.rx:
+	case <-mySessionLink.inFrameChan:
 	}
 
 	// check for link request error
@@ -910,7 +910,7 @@ func attachLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (
 	select {
 	case <-theSession.done:
 		return nil, theSession.err
-	case responseFrameBody = <-mySessionLink.rx:
+	case responseFrameBody = <-mySessionLink.inFrameChan:
 	}
 	debug(3, "RX: %s", responseFrameBody)
 	resp, ok := responseFrameBody.(*performAttach)
@@ -939,7 +939,7 @@ func attachLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (
 		if mySessionLink.dynamicAddr && resp.Target != nil {
 			mySessionLink.target.Address = resp.Target.Address
 		}
-		mySessionLink.transfers = make(chan performTransfer)
+		mySessionLink.outTransferFrameChan = make(chan performTransfer)
 		if resp.ReceiverSettleMode != nil {
 			mySessionLink.receiverSettleMode = resp.ReceiverSettleMode
 		}
@@ -985,7 +985,7 @@ Loop:
 		switch {
 		// enable outgoing transfers case if sender and credits are available
 		case isSender && theLink.linkCredit > 0:
-			outgoingTransfers = theLink.transfers
+			outgoingTransfers = theLink.outTransferFrameChan
 
 		// if receiver && half maxCredits have been processed, send more credits
 		case isReceiver && theLink.linkCredit+uint32(len(theLink.messages)) <= theLink.receiver.maxCredit/2:
@@ -1001,7 +1001,7 @@ Loop:
 
 		select {
 		// received frame
-		case fr := <-theLink.rx:
+		case fr := <-theLink.inFrameChan:
 			theLink.err = theLink.muxHandleFrame(fr)
 			if theLink.err != nil {
 				return
@@ -1014,14 +1014,14 @@ Loop:
 			// Ensure the session mux is not blocked
 			for {
 				select {
-				case theLink.session.txTransfer <- &outTransferFrame:
+				case theLink.session.outDataFrameChan <- &outTransferFrame:
 					// decrement link-credit after entire message transferred
 					if !outTransferFrame.More {
 						theLink.deliveryCount++
 						theLink.linkCredit--
 					}
 					continue Loop
-				case fr := <-theLink.rx:
+				case fr := <-theLink.inFrameChan:
 					theLink.err = theLink.muxHandleFrame(fr)
 					if theLink.err != nil {
 						return
@@ -1071,9 +1071,9 @@ func (theLink *link) muxFlow() error {
 	// Ensure the session mux is not blocked
 	for {
 		select {
-		case theLink.session.tx <- flowPerformative:
+		case theLink.session.outSvrFrameChan <- flowPerformative:
 			return nil
-		case fr := <-theLink.rx:
+		case fr := <-theLink.inFrameChan:
 			err := theLink.muxHandleFrame(fr)
 			if err != nil {
 				return err
@@ -1322,10 +1322,10 @@ func (theLink *link) muxDetach() {
 Loop:
 	for {
 		select {
-		case theLink.session.tx <- fr:
+		case theLink.session.outSvrFrameChan <- fr:
 			// after sending the detach frame, break the read loop
 			break Loop
-		case fr := <-theLink.rx:
+		case fr := <-theLink.inFrameChan:
 			// discard incoming frames to avoid blocking session.mux
 			if fr, ok := fr.(*performDetach); ok && fr.Closed {
 				theLink.detachReceived = true
@@ -1348,7 +1348,7 @@ Loop:
 		select {
 		// read from link until detach with Close == true is received,
 		// other frames are discarded.
-		case fr := <-theLink.rx:
+		case fr := <-theLink.inFrameChan:
 			if fr, ok := fr.(*performDetach); ok && fr.Closed {
 				return
 			}
