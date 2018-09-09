@@ -31,7 +31,7 @@ func TestConnOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.label, func(t *testing.T) {
-			got, err := newConn(nil, tt.opts...)
+			got, err := newAmqpConn(nil, tt.opts...)
 			if err != nil {
 				t.Fatal(err)
 			}

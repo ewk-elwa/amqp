@@ -33,7 +33,7 @@ func (s *saslCode) unmarshal(r *buffer) error {
 // on TLS/SSL enabled connection.
 func ConnSASLPlain(username, password string) ConnOption {
 	// TODO: how widely used is hostname? should it be supported
-	return func(c *conn) error {
+	return func(c *amqpConnection) error {
 		// make handlers map if no other mechanism has
 		if c.saslHandlers == nil {
 			c.saslHandlers = make(map[symbol]stateFunc)
@@ -63,7 +63,7 @@ func ConnSASLPlain(username, password string) ConnOption {
 
 // ConnSASLAnonymous enables SASL ANONYMOUS authentication for the connection.
 func ConnSASLAnonymous() ConnOption {
-	return func(c *conn) error {
+	return func(c *amqpConnection) error {
 		// make handlers map if no other mechanism has
 		if c.saslHandlers == nil {
 			c.saslHandlers = make(map[symbol]stateFunc)

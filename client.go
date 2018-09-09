@@ -29,7 +29,7 @@ var (
 
 // Client is an AMQP client connection.
 type Client struct {
-	conn *conn
+	amqpConn *amqpConnection
 }
 
 // Dial connects to an AMQP server.
@@ -39,25 +39,25 @@ type Client struct {
 //
 // If username and password information is not empty it's used as SASL PLAIN
 // credentials, equal to passing ConnSASLPlain option.
-func Dial(addr string, opts ...ConnOption) (*Client, error) {
-	u, err := url.Parse(addr)
+func Dial(theAddress string, opts ...ConnOption) (*Client, error) {
+	destURL, err := url.Parse(theAddress)
 	if err != nil {
 		return nil, err
 	}
-	host, port, err := net.SplitHostPort(u.Host)
+	host, port, err := net.SplitHostPort(destURL.Host)
 	if err != nil {
-		host = u.Host
+		host = destURL.Host
 		port = "5672" // use default port values if parse fails
-		if u.Scheme == "amqps" {
+		if destURL.Scheme == "amqps" {
 			port = "5671"
 		}
 	}
 
 	// prepend SASL credentials when the user/pass segment is not empty
-	if u.User != nil {
-		pass, _ := u.User.Password()
+	if destURL.User != nil {
+		pass, _ := destURL.User.Password()
 		opts = append([]ConnOption{
-			ConnSASLPlain(u.User.Username(), pass),
+			ConnSASLPlain(destURL.User.Username(), pass),
 		}, opts...)
 	}
 
@@ -66,94 +66,100 @@ func Dial(addr string, opts ...ConnOption) (*Client, error) {
 		ConnServerHostname(host),
 	}, opts...)
 
-	c, err := newConn(nil, opts...)
+	myAmqpConn, err := newAmqpConn(nil, opts...)
 	if err != nil {
 		return nil, err
 	}
-	switch u.Scheme {
+	switch destURL.Scheme {
 	case "amqp", "":
-		c.net, err = net.Dial("tcp", host+":"+port)
+		myAmqpConn.networkConnection, err = net.Dial("tcp", host+":"+port)
 	case "amqps":
-		c.initTLSConfig()
-		c.tlsNegotiation = false
-		c.net, err = tls.Dial("tcp", host+":"+port, c.tlsConfig)
+		myAmqpConn.initTLSConfig()
+		myAmqpConn.tlsNegotiation = false
+		myAmqpConn.networkConnection, err = tls.Dial("tcp", host+":"+port, myAmqpConn.tlsConfig)
 	default:
-		return nil, errorErrorf("unsupported scheme %q", u.Scheme)
+		return nil, errorErrorf("unsupported scheme %q", destURL.Scheme)
 	}
 	if err != nil {
 		return nil, err
 	}
-	err = c.start()
-	return &Client{conn: c}, err
+	err = myAmqpConn.start()
+	return &Client{amqpConn: myAmqpConn}, err
 }
 
 // New establishes an AMQP client connection over conn.
-func New(conn net.Conn, opts ...ConnOption) (*Client, error) {
-	c, err := newConn(conn, opts...)
+func New(theNetConn net.Conn, opts ...ConnOption) (*Client, error) {
+	myAmqpConn, err := newAmqpConn(theNetConn, opts...)
 	if err != nil {
 		return nil, err
 	}
-	err = c.start()
-	return &Client{conn: c}, err
+	err = myAmqpConn.start()
+	return &Client{amqpConn: myAmqpConn}, err
 }
 
 // Close disconnects the connection.
-func (c *Client) Close() error {
-	return c.conn.Close()
+func (theClient *Client) Close() error {
+	return theClient.amqpConn.Close()
 }
 
 // NewSession opens a new AMQP session to the server.
-func (c *Client) NewSession(opts ...SessionOption) (*Session, error) {
+func (theClient *Client) NewSession(opts ...SessionOption) (*Session, error) {
 	// get a session allocated by Client.mux
-	var sResp newSessionResp
+	var sessionResponse newSessionResponse
 	select {
-	case <-c.conn.done:
-		return nil, c.conn.getErr()
-	case sResp = <-c.conn.newSession:
+	case <-theClient.amqpConn.done:
+		return nil, theClient.amqpConn.getErr()
+	case sessionResponse = <-theClient.amqpConn.newSession:
 	}
 
-	if sResp.err != nil {
-		return nil, sResp.err
+	if sessionResponse.err != nil {
+		return nil, sessionResponse.err
 	}
-	s := sResp.session
+	mySession := sessionResponse.session
 
 	for _, opt := range opts {
-		err := opt(s)
+		err := opt(mySession)
 		if err != nil {
-			_ = s.Close(context.Background()) // deallocate session on error
+			_ = mySession.Close(context.Background()) // deallocate session on error
 			return nil, err
 		}
 	}
 
 	// send Begin to server
-	begin := &performBegin{
+	beginRxFrame := &performBegin{
 		NextOutgoingID: 0,
-		IncomingWindow: s.incomingWindow,
-		OutgoingWindow: s.outgoingWindow,
-		HandleMax:      s.handleMax,
+		IncomingWindow: mySession.incomingWindow,
+		OutgoingWindow: mySession.outgoingWindow,
+		HandleMax:      mySession.handleMax,
 	}
-	debug(1, "TX: %s", begin)
-	s.txFrame(begin, nil)
+	debug(1, "TX: %s", beginRxFrame)
+	mySession.txFrame(beginRxFrame, nil)
+
+	// TODO(eking) Send attach for sender
+
+	// Send attach for receiver
+
+	// Send flow message
 
 	// wait for response
-	var fr frame
+	var myRxFrame frame
 	select {
-	case <-c.conn.done:
-		return nil, c.conn.getErr()
-	case fr = <-s.rx:
+	case <-theClient.amqpConn.done:
+		return nil, theClient.amqpConn.getErr()
+	case myRxFrame = <-mySession.rx:
 	}
-	debug(1, "RX: %s", fr.body)
+	debug(1, "RX: %s", myRxFrame.body)
 
-	begin, ok := fr.body.(*performBegin)
+	beginRxFrame, ok := myRxFrame.body.(*performBegin)
 	if !ok {
-		_ = s.Close(context.Background()) // deallocate session on error
-		return nil, errorErrorf("unexpected begin response: %+v", fr.body)
+		_ = mySession.Close(context.Background()) // deallocate session on error
+		return nil, errorErrorf("unexpected begin response: %+v", myRxFrame.body)
 	}
 
 	// start Session multiplexor
-	go s.mux(begin)
+	go mySession.mux(beginRxFrame)
 
-	return s, nil
+	return mySession, nil
 }
 
 // Default session options
@@ -168,8 +174,8 @@ type SessionOption func(*Session) error
 // SessionIncomingWindow sets the maximum number of unacknowledged
 // transfer frames the server can send.
 func SessionIncomingWindow(window uint32) SessionOption {
-	return func(s *Session) error {
-		s.incomingWindow = window
+	return func(aSession *Session) error {
+		aSession.incomingWindow = window
 		return nil
 	}
 }
@@ -177,8 +183,8 @@ func SessionIncomingWindow(window uint32) SessionOption {
 // SessionOutgoingWindow sets the maximum number of unacknowledged
 // transfer frames the client can send.
 func SessionOutgoingWindow(window uint32) SessionOption {
-	return func(s *Session) error {
-		s.outgoingWindow = window
+	return func(aSession *Session) error {
+		aSession.outgoingWindow = window
 		return nil
 	}
 }
@@ -189,15 +195,15 @@ func SessionOutgoingWindow(window uint32) SessionOption {
 // n must be in the range 1 to 4294967296.
 //
 // Default: 4294967296.
-func SessionMaxLinks(n int) SessionOption {
-	return func(s *Session) error {
-		if n < 1 {
+func SessionMaxLinks(maxLinks int) SessionOption {
+	return func(aSession *Session) error {
+		if maxLinks < 1 {
 			return errorNew("max sessions cannot be less than 1")
 		}
-		if int64(n) > 4294967296 {
+		if int64(maxLinks) > 4294967296 {
 			return errorNew("max sessions cannot be greater than 4294967296")
 		}
-		s.handleMax = uint32(n - 1)
+		aSession.handleMax = uint32(maxLinks - 1)
 		return nil
 	}
 }
@@ -206,12 +212,12 @@ func SessionMaxLinks(n int) SessionOption {
 //
 // A session multiplexes Receivers.
 type Session struct {
-	channel       uint16                // session's local channel
-	remoteChannel uint16                // session's remote channel, owned by conn.mux
-	conn          *conn                 // underlying conn
-	rx            chan frame            // frames destined for this session are sent on this chan by conn.mux
-	tx            chan frameBody        // non-transfer frames to be sent; session must track disposition
-	txTransfer    chan *performTransfer // transfer frames to be sent; session must track disposition
+	channel           uint16                // session's local channel
+	remoteChannel     uint16                // session's remote channel, owned by conn.mux
+	theAmqpConnection *amqpConnection       // underlying conn
+	rx                chan frame            // frames destined for this session are sent on this chan by conn.mux
+	tx                chan frameBody        // non-transfer frames to be sent; session must track disposition
+	txTransfer        chan *performTransfer // transfer frames to be sent; session must track disposition
 
 	// flow control
 	incomingWindow uint32
@@ -230,20 +236,20 @@ type Session struct {
 	err       error
 }
 
-func newSession(c *conn, channel uint16) *Session {
+func newSession(theAmqpConnection *amqpConnection, channel uint16) *Session {
 	return &Session{
-		conn:             c,
-		channel:          channel,
-		rx:               make(chan frame),
-		tx:               make(chan frameBody),
-		txTransfer:       make(chan *performTransfer),
-		incomingWindow:   DefaultWindow,
-		outgoingWindow:   DefaultWindow,
-		handleMax:        DefaultMaxLinks - 1,
-		allocateHandle:   make(chan *link),
-		deallocateHandle: make(chan *link),
-		close:            make(chan struct{}),
-		done:             make(chan struct{}),
+		theAmqpConnection: theAmqpConnection,
+		channel:           channel,
+		rx:                make(chan frame),
+		tx:                make(chan frameBody),
+		txTransfer:        make(chan *performTransfer),
+		incomingWindow:    DefaultWindow,
+		outgoingWindow:    DefaultWindow,
+		handleMax:         DefaultMaxLinks - 1,
+		allocateHandle:    make(chan *link),
+		deallocateHandle:  make(chan *link),
+		close:             make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 }
 
@@ -251,24 +257,24 @@ func newSession(c *conn, channel uint16) *Session {
 //
 // If ctx expires while waiting for servers response, ctx.Err() will be returned.
 // The session will continue to wait for the response until the Client is closed.
-func (s *Session) Close(ctx context.Context) error {
-	s.closeOnce.Do(func() { close(s.close) })
+func (theSession *Session) Close(ctx context.Context) error {
+	theSession.closeOnce.Do(func() { close(theSession.close) })
 	select {
-	case <-s.done:
+	case <-theSession.done:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if s.err == ErrSessionClosed {
+	if theSession.err == ErrSessionClosed {
 		return nil
 	}
-	return s.err
+	return theSession.err
 }
 
 // txFrame sends a frame to the connWriter
-func (s *Session) txFrame(p frameBody, done chan deliveryState) error {
-	return s.conn.wantWriteFrame(frame{
+func (theSession *Session) txFrame(p frameBody, done chan deliveryState) error {
+	return theSession.theAmqpConnection.wantWriteFrame(frame{
 		type_:   frameTypeAMQP,
-		channel: s.channel,
+		channel: theSession.channel,
 		body:    p,
 		done:    done,
 	})
@@ -286,33 +292,33 @@ func randString(n int) string {
 }
 
 // NewReceiver opens a new receiver link on the session.
-func (s *Session) NewReceiver(opts ...LinkOption) (*Receiver, error) {
-	r := &Receiver{
+func (theSession *Session) NewReceiver(opts ...LinkOption) (*Receiver, error) {
+	myReceiver := &Receiver{
 		batching:    DefaultLinkBatching,
 		batchMaxAge: DefaultLinkBatchMaxAge,
 		maxCredit:   DefaultLinkCredit,
 	}
 
-	l, err := attachLink(s, r, opts)
+	myReceiverLink, err := attachLink(theSession, myReceiver, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	r.link = l
+	myReceiver.link = myReceiverLink
 
 	// batching is just extra overhead when maxCredits == 1
-	if r.maxCredit == 1 {
-		r.batching = false
+	if myReceiver.maxCredit == 1 {
+		myReceiver.batching = false
 	}
 
 	// create dispositions channel and start dispositionBatcher if batching enabled
-	if r.batching {
+	if myReceiver.batching {
 		// buffer dispositions chan to prevent disposition sends from blocking
-		r.dispositions = make(chan messageDisposition, r.maxCredit)
-		go r.dispositionBatcher()
+		myReceiver.dispositions = make(chan messageDisposition, myReceiver.maxCredit)
+		go myReceiver.dispositionBatcher()
 	}
 
-	return r, nil
+	return myReceiver, nil
 }
 
 // Sender sends messages on a single AMQP link.
@@ -333,8 +339,8 @@ type Sender struct {
 // has been requested (receiver settle mode is "Second"). In this case,
 // additional messages can be sent while the current goroutine is waiting
 // for the confirmation.
-func (s *Sender) Send(ctx context.Context, msg *Message) error {
-	done, err := s.send(ctx, msg)
+func (theSender *Sender) Send(ctx context.Context, msg *Message) error {
+	done, err := theSender.send(ctx, msg)
 	if err != nil {
 		return err
 	}
@@ -346,8 +352,8 @@ func (s *Sender) Send(ctx context.Context, msg *Message) error {
 			return state.Error
 		}
 		return nil
-	case <-s.link.done:
-		return s.link.err
+	case <-theSender.link.done:
+		return theSender.link.err
 	case <-ctx.Done():
 		return errorWrapf(ctx.Err(), "awaiting send")
 	}
@@ -355,45 +361,45 @@ func (s *Sender) Send(ctx context.Context, msg *Message) error {
 
 // send is separated from Send so that the mutex unlock can be deferred without
 // locking the transfer confirmation that happens in Send.
-func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (theSender *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, error) {
+	theSender.mu.Lock()
+	defer theSender.mu.Unlock()
 
-	s.buf.reset()
-	err := msg.marshal(&s.buf)
+	theSender.buf.reset()
+	err := msg.marshal(&theSender.buf)
 	if err != nil {
 		return nil, err
 	}
 
-	if s.link.maxMessageSize != 0 && uint64(s.buf.len()) > s.link.maxMessageSize {
-		return nil, errorErrorf("encoded message size exceeds max of %d", s.link.maxMessageSize)
+	if theSender.link.maxMessageSize != 0 && uint64(theSender.buf.len()) > theSender.link.maxMessageSize {
+		return nil, errorErrorf("encoded message size exceeds max of %d", theSender.link.maxMessageSize)
 	}
 
 	var (
-		maxPayloadSize = int64(s.link.session.conn.peerMaxFrameSize) - maxTransferFrameHeader
-		sndSettleMode  = s.link.senderSettleMode
-		rcvSettleMode  = s.link.receiverSettleMode
+		maxPayloadSize = int64(theSender.link.session.theAmqpConnection.peerMaxFrameSize) - maxTransferFrameHeader
+		sndSettleMode  = theSender.link.senderSettleMode
+		rcvSettleMode  = theSender.link.receiverSettleMode
 		senderSettled  = sndSettleMode != nil && *sndSettleMode == ModeSettled
-		deliveryID     = atomic.AddUint32(&s.link.session.nextDeliveryID, 1)
+		deliveryID     = atomic.AddUint32(&theSender.link.session.nextDeliveryID, 1)
 	)
 
 	// use uint64 encoded as []byte as deliveryTag
 	deliveryTag := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTag, s.nextDeliveryTag)
-	s.nextDeliveryTag++
+	binary.BigEndian.PutUint64(deliveryTag, theSender.nextDeliveryTag)
+	theSender.nextDeliveryTag++
 
 	fr := performTransfer{
-		Handle:        s.link.handle,
+		Handle:        theSender.link.handle,
 		DeliveryID:    &deliveryID,
 		DeliveryTag:   deliveryTag,
 		MessageFormat: &msg.Format,
-		More:          s.buf.len() > 0,
+		More:          theSender.buf.len() > 0,
 	}
 
 	for fr.More {
-		buf, _ := s.buf.next(maxPayloadSize)
+		buf, _ := theSender.buf.next(maxPayloadSize)
 		fr.Payload = append([]byte(nil), buf...)
-		fr.More = s.buf.len() > 0
+		fr.More = theSender.buf.len() > 0
 		if !fr.More {
 			// mark final transfer as settled when sender mode is settled
 			fr.Settled = senderSettled
@@ -408,9 +414,9 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 		}
 
 		select {
-		case s.link.transfers <- fr:
-		case <-s.link.done:
-			return nil, s.link.err
+		case theSender.link.transfers <- fr:
+		case <-theSender.link.done:
+			return nil, theSender.link.err
 		case <-ctx.Done():
 			return nil, errorWrapf(ctx.Err(), "awaiting send")
 		}
@@ -425,35 +431,35 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 }
 
 // Address returns the link's address.
-func (s *Sender) Address() string {
-	if s.link.target == nil {
+func (theSender *Sender) Address() string {
+	if theSender.link.target == nil {
 		return ""
 	}
-	return s.link.target.Address
+	return theSender.link.target.Address
 }
 
 // Close closes the Sender and AMQP link.
-func (s *Sender) Close(ctx context.Context) error {
-	return s.link.Close(ctx)
+func (theSender *Sender) Close(ctx context.Context) error {
+	return theSender.link.Close(ctx)
 }
 
 // NewSender opens a new sender link on the session.
-func (s *Session) NewSender(opts ...LinkOption) (*Sender, error) {
-	l, err := attachLink(s, nil, opts)
+func (theSession *Session) NewSender(opts ...LinkOption) (*Sender, error) {
+	mySessionLink, err := attachLink(theSession, nil, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Sender{link: l}, nil
+	return &Sender{link: mySessionLink}, nil
 }
 
-func (s *Session) mux(remoteBegin *performBegin) {
-	defer close(s.done)
+func (theSender *Session) mux(remoteBegin *performBegin) {
+	defer close(theSender.done)
 
 	var (
-		links       = make(map[uint32]*link)    // mapping of remote handles to links
-		linksByName = make(map[string]*link)    // maping of names to links
-		handles     = &bitmap{max: s.handleMax} // allocated handles
+		links       = make(map[uint32]*link)            // mapping of remote handles to links
+		linksByName = make(map[string]*link)            // maping of names to links
+		handles     = &bitmap{max: theSender.handleMax} // allocated handles
 
 		handlesByDeliveryID       = make(map[uint32]uint32) // mapping of deliveryIDs to handles
 		deliveryIDByHandle        = make(map[uint32]uint32) // mapping of handles to latest deliveryID
@@ -463,77 +469,82 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 		// flow control values
 		nextOutgoingID       uint32
-		nextIncomingID       = remoteBegin.NextOutgoingID
+		nextIncomingID       = uint32(0)
+		remoteIncomingWindow = uint32(0)
+		remoteOutgoingWindow = uint32(0)
+	)
+	if remoteBegin != nil {
+		nextIncomingID = remoteBegin.NextOutgoingID
 		remoteIncomingWindow = remoteBegin.IncomingWindow
 		remoteOutgoingWindow = remoteBegin.OutgoingWindow
-	)
+	}
 
 	for {
-		txTransfer := s.txTransfer
+		txTransfer := theSender.txTransfer
 		// disable txTransfer if flow control windows have been exceeded
-		if remoteIncomingWindow == 0 || s.outgoingWindow == 0 {
+		if remoteIncomingWindow == 0 || theSender.outgoingWindow == 0 {
 			txTransfer = nil
 		}
 
 		select {
 		// conn has completed, exit
-		case <-s.conn.done:
-			s.err = s.conn.getErr()
+		case <-theSender.theAmqpConnection.done:
+			theSender.err = theSender.theAmqpConnection.getErr()
 			return
 
 		// session is being closed by user
-		case <-s.close:
-			s.txFrame(&performEnd{}, nil)
+		case <-theSender.close:
+			theSender.txFrame(&performEnd{}, nil)
 
 			// discard frames until End is received or conn closed
 		EndLoop:
 			for {
 				select {
-				case fr := <-s.rx:
-					_, ok := fr.body.(*performEnd)
+				case inFrame := <-theSender.rx:
+					_, ok := inFrame.body.(*performEnd)
 					if ok {
 						break EndLoop
 					}
-				case <-s.conn.done:
-					s.err = s.conn.getErr()
+				case <-theSender.theAmqpConnection.done:
+					theSender.err = theSender.theAmqpConnection.getErr()
 					return
 				}
 			}
 
 			// release session
 			select {
-			case s.conn.delSession <- s:
-				s.err = ErrSessionClosed
-			case <-s.conn.done:
-				s.err = s.conn.getErr()
+			case theSender.theAmqpConnection.delSession <- theSender:
+				theSender.err = ErrSessionClosed
+			case <-theSender.theAmqpConnection.done:
+				theSender.err = theSender.theAmqpConnection.getErr()
 			}
 			return
 
 		// handle allocation request
-		case l := <-s.allocateHandle:
+		case senderLink := <-theSender.allocateHandle:
 			next, ok := handles.next()
 			if !ok {
-				l.err = errorErrorf("reached session handle max (%d)", s.handleMax)
-				l.rx <- nil
+				senderLink.err = errorErrorf("reached session handle max (%d)", theSender.handleMax)
+				senderLink.rx <- nil
 				continue
 			}
 
-			l.handle = next         // allocate handle to the link
-			linksByName[l.name] = l // add to mapping
-			l.rx <- nil             // send nil on channel to indicate allocation complete
+			senderLink.handle = next                  // allocate handle to the link
+			linksByName[senderLink.name] = senderLink // add to mapping
+			senderLink.rx <- nil                      // send nil on channel to indicate allocation complete
 
 		// handle deallocation request
-		case l := <-s.deallocateHandle:
-			delete(links, l.remoteHandle)
-			delete(deliveryIDByHandle, l.handle)
-			handles.remove(l.handle)
-			close(l.rx) // close channel to indicate deallocation
+		case senderLink := <-theSender.deallocateHandle:
+			delete(links, senderLink.remoteHandle)
+			delete(deliveryIDByHandle, senderLink.handle)
+			handles.remove(senderLink.handle)
+			close(senderLink.rx) // close channel to indicate deallocation
 
 		// incoming frame for link
-		case fr := <-s.rx:
-			debug(1, "RX(Session): %s", fr.body)
+		case inFrame := <-theSender.rx:
+			debug(1, "RX(Session): %s", inFrame.body)
 
-			switch body := fr.body.(type) {
+			switch body := inFrame.body.(type) {
 			// Disposition frames can reference transfers from more than one
 			// link. Send this frame to all of them.
 			case *performDisposition:
@@ -572,7 +583,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 						continue
 					}
 
-					s.muxFrameToLink(link, fr.body)
+					theSender.muxFrameToLink(link, inFrame.body)
 				}
 				continue
 			case *performFlow:
@@ -580,13 +591,13 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					// This is a protocol error:
 					//       "[...] MUST be set if the peer has received
 					//        the begin frame for the session"
-					s.txFrame(&performEnd{
+					theSender.txFrame(&performEnd{
 						Error: &Error{
 							Condition:   ErrorNotAllowed,
 							Description: "next-incoming-id not set after session established",
 						},
 					}, nil)
-					s.err = errors.New("protocol error: received flow without next-incoming-id after session established")
+					theSender.err = errors.New("protocol error: received flow without next-incoming-id after session established")
 					return
 				}
 
@@ -615,7 +626,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 						continue
 					}
 
-					s.muxFrameToLink(link, fr.body)
+					theSender.muxFrameToLink(link, inFrame.body)
 					continue
 				}
 
@@ -623,12 +634,12 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					niID := nextIncomingID
 					resp := &performFlow{
 						NextIncomingID: &niID,
-						IncomingWindow: s.incomingWindow,
+						IncomingWindow: theSender.incomingWindow,
 						NextOutgoingID: nextOutgoingID,
-						OutgoingWindow: s.outgoingWindow,
+						OutgoingWindow: theSender.outgoingWindow,
 					}
 					debug(1, "TX: %s", resp)
-					s.txFrame(resp, nil)
+					theSender.txFrame(resp, nil)
 				}
 
 			case *performAttach:
@@ -644,7 +655,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				link.remoteHandle = body.Handle
 				links[link.remoteHandle] = link
 
-				s.muxFrameToLink(link, fr.body)
+				theSender.muxFrameToLink(link, inFrame.body)
 
 			case *performTransfer:
 				// "Upon receiving a transfer, the receiving endpoint will
@@ -660,8 +671,8 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				}
 
 				select {
-				case <-s.conn.done:
-				case link.rx <- fr.body:
+				case <-theSender.theAmqpConnection.done:
+				case link.rx <- inFrame.body:
 				}
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
@@ -670,17 +681,17 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				}
 
 				// Update peer's outgoing window if half has been consumed.
-				if remoteOutgoingWindow < s.incomingWindow/2 {
+				if remoteOutgoingWindow < theSender.incomingWindow/2 {
 					nID := nextIncomingID
 					flow := &performFlow{
 						NextIncomingID: &nID,
-						IncomingWindow: s.incomingWindow,
+						IncomingWindow: theSender.incomingWindow,
 						NextOutgoingID: nextOutgoingID,
-						OutgoingWindow: s.outgoingWindow,
+						OutgoingWindow: theSender.outgoingWindow,
 					}
 					debug(1, "TX(Session): %s", flow)
-					s.txFrame(flow, nil)
-					remoteOutgoingWindow = s.incomingWindow
+					theSender.txFrame(flow, nil)
+					remoteOutgoingWindow = theSender.incomingWindow
 				}
 
 			case *performDetach:
@@ -688,49 +699,49 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				if !ok {
 					continue
 				}
-				s.muxFrameToLink(link, fr.body)
+				theSender.muxFrameToLink(link, inFrame.body)
 
 			case *performEnd:
-				s.txFrame(&performEnd{}, nil)
-				s.err = errorErrorf("session ended by server: %s", body.Error)
+				theSender.txFrame(&performEnd{}, nil)
+				theSender.err = errorErrorf("session ended by server: %s", body.Error)
 				return
 
 			default:
 				fmt.Printf("Unexpected frame: %s\n", body)
 			}
 
-		case fr := <-txTransfer:
+		case inTransferFrame := <-txTransfer:
 
 			// record current delivery ID
 			var deliveryID uint32
-			if fr.DeliveryID != nil {
-				deliveryID = *fr.DeliveryID
-				deliveryIDByHandle[fr.Handle] = deliveryID
+			if inTransferFrame.DeliveryID != nil {
+				deliveryID = *inTransferFrame.DeliveryID
+				deliveryIDByHandle[inTransferFrame.Handle] = deliveryID
 
 				// add to handleByDeliveryID if not sender-settled
-				if !fr.Settled {
-					handlesByDeliveryID[deliveryID] = fr.Handle
+				if !inTransferFrame.Settled {
+					handlesByDeliveryID[deliveryID] = inTransferFrame.Handle
 				}
 			} else {
 				// if fr.DeliveryID is nil it must have been added
 				// to deliveryIDByHandle already
-				deliveryID = deliveryIDByHandle[fr.Handle]
+				deliveryID = deliveryIDByHandle[inTransferFrame.Handle]
 			}
 
 			// frame has been sender-settled, remove from map
-			if fr.Settled {
+			if inTransferFrame.Settled {
 				delete(handlesByDeliveryID, deliveryID)
 			}
 
 			// if confirmSettlement requested, add done chan to map
 			// and clear from frame so conn doesn't close it.
-			if fr.confirmSettlement && fr.done != nil {
-				settlementByDeliveryID[deliveryID] = fr.done
-				fr.done = nil
+			if inTransferFrame.confirmSettlement && inTransferFrame.done != nil {
+				settlementByDeliveryID[deliveryID] = inTransferFrame.done
+				inTransferFrame.done = nil
 			}
 
-			debug(2, "TX(Session): %s", fr)
-			s.txFrame(fr, fr.done)
+			debug(2, "TX(Session): %s", inTransferFrame)
+			theSender.txFrame(inTransferFrame, inTransferFrame.done)
 
 			// "Upon sending a transfer, the sending endpoint will increment
 			// its next-outgoing-id, decrement its remote-incoming-window,
@@ -738,32 +749,32 @@ func (s *Session) mux(remoteBegin *performBegin) {
 			nextOutgoingID++
 			remoteIncomingWindow--
 
-		case fr := <-s.tx:
+		case fr := <-theSender.tx:
 			switch fr := fr.(type) {
 			case *performFlow:
 				niID := nextIncomingID
 				fr.NextIncomingID = &niID
-				fr.IncomingWindow = s.incomingWindow
+				fr.IncomingWindow = theSender.incomingWindow
 				fr.NextOutgoingID = nextOutgoingID
-				fr.OutgoingWindow = s.outgoingWindow
+				fr.OutgoingWindow = theSender.outgoingWindow
 				debug(1, "TX(Session): %s", fr)
-				s.txFrame(fr, nil)
-				remoteOutgoingWindow = s.incomingWindow
+				theSender.txFrame(fr, nil)
+				remoteOutgoingWindow = theSender.incomingWindow
 			case *performTransfer:
 				panic("transfer frames must use txTransfer")
 			default:
 				debug(1, "TX(Session): %s", fr)
-				s.txFrame(fr, nil)
+				theSender.txFrame(fr, nil)
 			}
 		}
 	}
 }
 
-func (s *Session) muxFrameToLink(l *link, fr frameBody) {
+func (theSession *Session) muxFrameToLink(theLink *link, theFrameBody frameBody) {
 	select {
-	case l.rx <- fr:
-	case <-l.done:
-	case <-s.conn.done:
+	case theLink.rx <- theFrameBody:
+	case <-theLink.done:
+	case <-theSession.theAmqpConnection.done:
 	}
 }
 
@@ -830,120 +841,120 @@ type link struct {
 }
 
 // attachLink is used by Receiver and Sender to create new links
-func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
-	l, err := newLink(s, r, opts)
+func attachLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (*link, error) {
+	mySessionLink, err := newLink(theSession, theReceiver, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	isReceiver := r != nil
+	isReceiver := theReceiver != nil
 
 	// buffer rx to linkCredit so that conn.mux won't block
 	// attempting to send to a slow reader
 	if isReceiver {
-		l.rx = make(chan frameBody, l.linkCredit)
+		mySessionLink.rx = make(chan frameBody, mySessionLink.linkCredit)
 	} else {
-		l.rx = make(chan frameBody, 1)
+		mySessionLink.rx = make(chan frameBody, 1)
 	}
 
 	// request handle from Session.mux
 	select {
-	case <-s.done:
-		return nil, s.err
-	case s.allocateHandle <- l:
+	case <-theSession.done:
+		return nil, theSession.err
+	case theSession.allocateHandle <- mySessionLink:
 	}
 
 	// wait for handle allocation
 	select {
-	case <-s.done:
-		return nil, s.err
-	case <-l.rx:
+	case <-theSession.done:
+		return nil, theSession.err
+	case <-mySessionLink.rx:
 	}
 
 	// check for link request error
-	if l.err != nil {
-		return nil, l.err
+	if mySessionLink.err != nil {
+		return nil, mySessionLink.err
 	}
 
-	attach := &performAttach{
-		Name:               l.name,
-		Handle:             l.handle,
-		ReceiverSettleMode: l.receiverSettleMode,
-		SenderSettleMode:   l.senderSettleMode,
-		MaxMessageSize:     l.maxMessageSize,
-		Source:             l.source,
-		Target:             l.target,
-		Properties:         l.properties,
+	attachPerformative := &performAttach{
+		Name:               mySessionLink.name,
+		Handle:             mySessionLink.handle,
+		ReceiverSettleMode: mySessionLink.receiverSettleMode,
+		SenderSettleMode:   mySessionLink.senderSettleMode,
+		MaxMessageSize:     mySessionLink.maxMessageSize,
+		Source:             mySessionLink.source,
+		Target:             mySessionLink.target,
+		Properties:         mySessionLink.properties,
 	}
 
 	if isReceiver {
-		attach.Role = roleReceiver
-		if attach.Source == nil {
-			attach.Source = new(source)
+		attachPerformative.Role = roleReceiver
+		if attachPerformative.Source == nil {
+			attachPerformative.Source = new(source)
 		}
-		attach.Source.Dynamic = l.dynamicAddr
+		attachPerformative.Source.Dynamic = mySessionLink.dynamicAddr
 	} else {
-		attach.Role = roleSender
-		if attach.Target == nil {
-			attach.Target = new(target)
+		attachPerformative.Role = roleSender
+		if attachPerformative.Target == nil {
+			attachPerformative.Target = new(target)
 		}
-		attach.Target.Dynamic = l.dynamicAddr
+		attachPerformative.Target.Dynamic = mySessionLink.dynamicAddr
 	}
 
 	// send Attach frame
-	debug(1, "TX: %s", attach)
-	s.txFrame(attach, nil)
+	debug(1, "TX: %s", attachPerformative)
+	theSession.txFrame(attachPerformative, nil)
 
 	// wait for response
-	var fr frameBody
+	var responseFrameBody frameBody
 	select {
-	case <-s.done:
-		return nil, s.err
-	case fr = <-l.rx:
+	case <-theSession.done:
+		return nil, theSession.err
+	case responseFrameBody = <-mySessionLink.rx:
 	}
-	debug(3, "RX: %s", fr)
-	resp, ok := fr.(*performAttach)
+	debug(3, "RX: %s", responseFrameBody)
+	resp, ok := responseFrameBody.(*performAttach)
 	if !ok {
-		return nil, errorErrorf("unexpected attach response: %#v", fr)
+		return nil, errorErrorf("unexpected attach response: %#v", responseFrameBody)
 	}
 
-	if l.maxMessageSize == 0 || resp.MaxMessageSize < l.maxMessageSize {
-		l.maxMessageSize = resp.MaxMessageSize
+	if mySessionLink.maxMessageSize == 0 || resp.MaxMessageSize < mySessionLink.maxMessageSize {
+		mySessionLink.maxMessageSize = resp.MaxMessageSize
 	}
 
 	if isReceiver {
 		// if dynamic address requested, copy assigned name to address
-		if l.dynamicAddr && resp.Source != nil {
-			l.source.Address = resp.Source.Address
+		if mySessionLink.dynamicAddr && resp.Source != nil {
+			mySessionLink.source.Address = resp.Source.Address
 		}
 		// deliveryCount is a sequence number, must initialize to sender's initial sequence number
-		l.deliveryCount = resp.InitialDeliveryCount
+		mySessionLink.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
-		l.messages = make(chan Message, l.receiver.maxCredit)
+		mySessionLink.messages = make(chan Message, mySessionLink.receiver.maxCredit)
 		if resp.SenderSettleMode != nil {
-			l.senderSettleMode = resp.SenderSettleMode
+			mySessionLink.senderSettleMode = resp.SenderSettleMode
 		}
 	} else {
 		// if dynamic address requested, copy assigned name to address
-		if l.dynamicAddr && resp.Target != nil {
-			l.target.Address = resp.Target.Address
+		if mySessionLink.dynamicAddr && resp.Target != nil {
+			mySessionLink.target.Address = resp.Target.Address
 		}
-		l.transfers = make(chan performTransfer)
+		mySessionLink.transfers = make(chan performTransfer)
 		if resp.ReceiverSettleMode != nil {
-			l.receiverSettleMode = resp.ReceiverSettleMode
+			mySessionLink.receiverSettleMode = resp.ReceiverSettleMode
 		}
 	}
 
-	go l.mux()
+	go mySessionLink.mux()
 
-	return l, nil
+	return mySessionLink, nil
 }
 
-func newLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
-	l := &link{
+func newLink(theSession *Session, theReceiver *Receiver, opts []LinkOption) (*link, error) {
+	mySessionLink := &link{
 		name:          randString(40),
-		session:       s,
-		receiver:      r,
+		session:       theSession,
+		receiver:      theReceiver,
 		close:         make(chan struct{}),
 		done:          make(chan struct{}),
 		receiverReady: make(chan struct{}, 1),
@@ -951,20 +962,20 @@ func newLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 	// configure options
 	for _, o := range opts {
-		err := o(l)
+		err := o(mySessionLink)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return l, nil
+	return mySessionLink, nil
 }
 
-func (l *link) mux() {
-	defer l.muxDetach()
+func (theLink *link) mux() {
+	defer theLink.muxDetach()
 
 	var (
-		isReceiver = l.receiver != nil
+		isReceiver = theLink.receiver != nil
 		isSender   = !isReceiver
 	)
 
@@ -973,125 +984,125 @@ Loop:
 		var outgoingTransfers chan performTransfer
 		switch {
 		// enable outgoing transfers case if sender and credits are available
-		case isSender && l.linkCredit > 0:
-			outgoingTransfers = l.transfers
+		case isSender && theLink.linkCredit > 0:
+			outgoingTransfers = theLink.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(len(l.messages)) <= l.receiver.maxCredit/2:
-			l.err = l.muxFlow()
-			if l.err != nil {
+		case isReceiver && theLink.linkCredit+uint32(len(theLink.messages)) <= theLink.receiver.maxCredit/2:
+			theLink.err = theLink.muxFlow()
+			if theLink.err != nil {
 				return
 			}
-			atomic.StoreUint32(&l.paused, 0)
+			atomic.StoreUint32(&theLink.paused, 0)
 
-		case isReceiver && l.linkCredit == 0:
-			atomic.StoreUint32(&l.paused, 1)
+		case isReceiver && theLink.linkCredit == 0:
+			atomic.StoreUint32(&theLink.paused, 1)
 		}
 
 		select {
 		// received frame
-		case fr := <-l.rx:
-			l.err = l.muxHandleFrame(fr)
-			if l.err != nil {
+		case fr := <-theLink.rx:
+			theLink.err = theLink.muxHandleFrame(fr)
+			if theLink.err != nil {
 				return
 			}
 
 		// send data
-		case tr := <-outgoingTransfers:
-			debug(3, "TX(link): %s", tr)
+		case outTransferFrame := <-outgoingTransfers:
+			debug(3, "TX(link): %s", outTransferFrame)
 
 			// Ensure the session mux is not blocked
 			for {
 				select {
-				case l.session.txTransfer <- &tr:
+				case theLink.session.txTransfer <- &outTransferFrame:
 					// decrement link-credit after entire message transferred
-					if !tr.More {
-						l.deliveryCount++
-						l.linkCredit--
+					if !outTransferFrame.More {
+						theLink.deliveryCount++
+						theLink.linkCredit--
 					}
 					continue Loop
-				case fr := <-l.rx:
-					l.err = l.muxHandleFrame(fr)
-					if l.err != nil {
+				case fr := <-theLink.rx:
+					theLink.err = theLink.muxHandleFrame(fr)
+					if theLink.err != nil {
 						return
 					}
-				case <-l.close:
-					l.err = ErrLinkClosed
+				case <-theLink.close:
+					theLink.err = ErrLinkClosed
 					return
-				case <-l.session.done:
-					l.err = l.session.err
+				case <-theLink.session.done:
+					theLink.err = theLink.session.err
 					return
 				}
 			}
 
-		case <-l.receiverReady:
+		case <-theLink.receiverReady:
 			continue
-		case <-l.close:
-			l.err = ErrLinkClosed
+		case <-theLink.close:
+			theLink.err = ErrLinkClosed
 			return
-		case <-l.session.done:
-			l.err = l.session.err
+		case <-theLink.session.done:
+			theLink.err = theLink.session.err
 			return
 		}
 	}
 }
 
 // muxFlow sends tr to the session mux.
-func (l *link) muxFlow() error {
+func (theLink *link) muxFlow() error {
 	// copy because sent by pointer below; prevent race
 	var (
-		linkCredit    = l.receiver.maxCredit - uint32(len(l.messages))
-		deliveryCount = l.deliveryCount
+		linkCredit    = theLink.receiver.maxCredit - uint32(len(theLink.messages))
+		deliveryCount = theLink.deliveryCount
 	)
 
-	fr := &performFlow{
-		Handle:        &l.handle,
+	flowPerformative := &performFlow{
+		Handle:        &theLink.handle,
 		DeliveryCount: &deliveryCount,
 		LinkCredit:    &linkCredit, // max number of messages
 	}
-	debug(3, "TX: %s", fr)
+	debug(3, "TX: %s", flowPerformative)
 
 	// Update credit. This must happen before entering loop below
 	// because incoming messages handled while waiting to transmit
 	// flow increment deliveryCount. This causes the credit to become
 	// out of sync with the server.
-	l.linkCredit = linkCredit
+	theLink.linkCredit = linkCredit
 
 	// Ensure the session mux is not blocked
 	for {
 		select {
-		case l.session.tx <- fr:
+		case theLink.session.tx <- flowPerformative:
 			return nil
-		case fr := <-l.rx:
-			err := l.muxHandleFrame(fr)
+		case fr := <-theLink.rx:
+			err := theLink.muxHandleFrame(fr)
 			if err != nil {
 				return err
 			}
-		case <-l.close:
+		case <-theLink.close:
 			return ErrLinkClosed
-		case <-l.session.done:
-			return l.session.err
+		case <-theLink.session.done:
+			return theLink.session.err
 		}
 	}
 }
 
-func (l *link) muxReceive(fr performTransfer) error {
+func (theLink *link) muxReceive(transferFrame performTransfer) error {
 	// record the delivery ID and message format if this is
 	// the first frame of the message
-	if !l.more {
-		if fr.DeliveryID != nil {
-			l.msg.deliveryID = *fr.DeliveryID
+	if !theLink.more {
+		if transferFrame.DeliveryID != nil {
+			theLink.msg.deliveryID = *transferFrame.DeliveryID
 		}
 
-		if fr.MessageFormat != nil {
-			l.msg.Format = *fr.MessageFormat
+		if transferFrame.MessageFormat != nil {
+			theLink.msg.Format = *transferFrame.MessageFormat
 		}
 	}
 
 	// ensure maxMessageSize will not be exceeded
-	if l.maxMessageSize != 0 && uint64(l.buf.len())+uint64(len(fr.Payload)) > l.maxMessageSize {
-		msg := fmt.Sprintf("received message larger than max size of %d", l.maxMessageSize)
-		l.closeWithError(&Error{
+	if theLink.maxMessageSize != 0 && uint64(theLink.buf.len())+uint64(len(transferFrame.Payload)) > theLink.maxMessageSize {
+		msg := fmt.Sprintf("received message larger than max size of %d", theLink.maxMessageSize)
+		theLink.closeWithError(&Error{
 			Condition:   ErrorMessageSizeExceeded,
 			Description: msg,
 		})
@@ -1099,73 +1110,73 @@ func (l *link) muxReceive(fr performTransfer) error {
 	}
 
 	// add the payload the the buffer
-	l.buf.write(fr.Payload)
+	theLink.buf.write(transferFrame.Payload)
 
 	// mark as settled if at least one frame is settled
-	l.msg.settled = l.msg.settled || fr.Settled
+	theLink.msg.settled = theLink.msg.settled || transferFrame.Settled
 
 	// save in-progress status
-	l.more = fr.More
+	theLink.more = transferFrame.More
 
-	if fr.More {
+	if transferFrame.More {
 		return nil
 	}
 
 	// last frame in message
-	err := l.msg.unmarshal(&l.buf)
+	err := theLink.msg.unmarshal(&theLink.buf)
 	if err != nil {
 		return err
 	}
 
 	// send to receiver, this should never block due to buffering
 	// and flow control.
-	l.messages <- l.msg
+	theLink.messages <- theLink.msg
 
 	// reset progress
-	l.buf.reset()
-	l.msg = Message{}
+	theLink.buf.reset()
+	theLink.msg = Message{}
 
 	// decrement link-credit after entire message received
-	l.deliveryCount++
-	l.linkCredit--
+	theLink.deliveryCount++
+	theLink.linkCredit--
 
 	return nil
 }
 
 // muxHandleFrame processes fr based on type.
-func (l *link) muxHandleFrame(fr frameBody) error {
+func (theLink *link) muxHandleFrame(theFrameBody frameBody) error {
 	var (
-		isSender               = l.receiver == nil
-		errOnRejectDisposition = isSender && (l.receiverSettleMode == nil || *l.receiverSettleMode == ModeFirst)
+		isSender               = theLink.receiver == nil
+		errOnRejectDisposition = isSender && (theLink.receiverSettleMode == nil || *theLink.receiverSettleMode == ModeFirst)
 	)
 
-	switch fr := fr.(type) {
+	switch fr := theFrameBody.(type) {
 	// message frame
 	case *performTransfer:
 		debug(3, "RX: %s", fr)
 		if isSender {
 			// Senders should never receive transfer frames, but handle it just in case.
-			l.closeWithError(&Error{
+			theLink.closeWithError(&Error{
 				Condition:   ErrorNotAllowed,
 				Description: "sender cannot process transfer frame",
 			})
 			return errorErrorf("sender received transfer frame")
 		}
 
-		return l.muxReceive(*fr)
+		return theLink.muxReceive(*fr)
 
 	// flow control frame
 	case *performFlow:
 		debug(3, "RX: %s", fr)
 		if isSender {
-			linkCredit := *fr.LinkCredit - l.deliveryCount
+			linkCredit := *fr.LinkCredit - theLink.deliveryCount
 			if fr.DeliveryCount != nil {
 				// DeliveryCount can be nil if the receiver hasn't processed
 				// the attach. That shouldn't be the case here, but it's
 				// what ActiveMQ does.
 				linkCredit += *fr.DeliveryCount
 			}
-			l.linkCredit = linkCredit
+			theLink.linkCredit = linkCredit
 		}
 
 		if !fr.Echo {
@@ -1174,18 +1185,18 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 
 		var (
 			// copy because sent by pointer below; prevent race
-			linkCredit    = l.linkCredit
-			deliveryCount = l.deliveryCount
+			linkCredit    = theLink.linkCredit
+			deliveryCount = theLink.deliveryCount
 		)
 
 		// send flow
 		resp := &performFlow{
-			Handle:        &l.handle,
+			Handle:        &theLink.handle,
 			DeliveryCount: &deliveryCount,
 			LinkCredit:    &linkCredit, // max number of messages
 		}
 		debug(1, "TX: %s", resp)
-		l.session.txFrame(resp, nil)
+		theLink.session.txFrame(resp, nil)
 
 	// remote side is closing links
 	case *performDetach:
@@ -1196,7 +1207,7 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 		}
 
 		// set detach received and close link
-		l.detachReceived = true
+		theLink.detachReceived = true
 
 		return errorWrapf(&DetachError{fr.Error}, "received detach frame")
 
@@ -1204,8 +1215,8 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 		debug(3, "RX: %s", fr)
 
 		// Unblock receivers waiting for message disposition
-		if l.receiver != nil {
-			l.receiver.inFlight.remove(fr.First, fr.Last, nil)
+		if theLink.receiver != nil {
+			theLink.receiver.inFlight.remove(fr.First, fr.Last, nil)
 		}
 
 		// If sending async and a message is rejected, cause a link error.
@@ -1226,7 +1237,7 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 			Settled: true,
 		}
 		debug(1, "TX: %s", resp)
-		l.session.txFrame(resp, nil)
+		theLink.session.txFrame(resp, nil)
 
 	default:
 		debug(1, "RX: %s", fr)
@@ -1243,47 +1254,47 @@ func (l *link) muxHandleFrame(fr frameBody) error {
 // If ctx expires while waiting for servers response, ctx.Err() will be returned.
 // The session will continue to wait for the response until the Session or Client
 // is closed.
-func (l *link) Close(ctx context.Context) error {
-	l.closeOnce.Do(func() { close(l.close) })
+func (theLink *link) Close(ctx context.Context) error {
+	theLink.closeOnce.Do(func() { close(theLink.close) })
 	select {
-	case <-l.done:
+	case <-theLink.done:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if l.err == ErrLinkClosed {
+	if theLink.err == ErrLinkClosed {
 		return nil
 	}
-	return l.err
+	return theLink.err
 }
 
-func (l *link) closeWithError(de *Error) {
-	l.closeOnce.Do(func() {
-		l.detachErrorMu.Lock()
-		l.detachError = de
-		l.detachErrorMu.Unlock()
-		close(l.close)
+func (theLink *link) closeWithError(de *Error) {
+	theLink.closeOnce.Do(func() {
+		theLink.detachErrorMu.Lock()
+		theLink.detachError = de
+		theLink.detachErrorMu.Unlock()
+		close(theLink.close)
 	})
 }
 
-func (l *link) muxDetach() {
+func (theLink *link) muxDetach() {
 	defer func() {
 		// final cleanup and signaling
 
 		// deallocate handle
 		select {
-		case l.session.deallocateHandle <- l:
-		case <-l.session.done:
-			if l.err == nil {
-				l.err = l.session.err
+		case theLink.session.deallocateHandle <- theLink:
+		case <-theLink.session.done:
+			if theLink.err == nil {
+				theLink.err = theLink.session.err
 			}
 		}
 
 		// signal other goroutines that link is done
-		close(l.done)
+		close(theLink.done)
 
 		// unblock any in flight message dispositions
-		if l.receiver != nil {
-			l.receiver.inFlight.clear(l.err)
+		if theLink.receiver != nil {
+			theLink.receiver.inFlight.clear(theLink.err)
 		}
 	}()
 
@@ -1298,12 +1309,12 @@ func (l *link) muxDetach() {
 	// the partner MUST signal that it has closed the link by
 	// reattaching and then sending a closing detach."
 
-	l.detachErrorMu.Lock()
-	detachError := l.detachError
-	l.detachErrorMu.Unlock()
+	theLink.detachErrorMu.Lock()
+	detachError := theLink.detachError
+	theLink.detachErrorMu.Unlock()
 
 	fr := &performDetach{
-		Handle: l.handle,
+		Handle: theLink.handle,
 		Closed: true,
 		Error:  detachError,
 	}
@@ -1311,17 +1322,17 @@ func (l *link) muxDetach() {
 Loop:
 	for {
 		select {
-		case l.session.tx <- fr:
+		case theLink.session.tx <- fr:
 			// after sending the detach frame, break the read loop
 			break Loop
-		case fr := <-l.rx:
+		case fr := <-theLink.rx:
 			// discard incoming frames to avoid blocking session.mux
 			if fr, ok := fr.(*performDetach); ok && fr.Closed {
-				l.detachReceived = true
+				theLink.detachReceived = true
 			}
-		case <-l.session.done:
-			if l.err == nil {
-				l.err = l.session.err
+		case <-theLink.session.done:
+			if theLink.err == nil {
+				theLink.err = theLink.session.err
 			}
 			return
 		}
@@ -1329,7 +1340,7 @@ Loop:
 
 	// don't wait for remote to detach when already
 	// received or closing due to error
-	if l.detachReceived || detachError != nil {
+	if theLink.detachReceived || detachError != nil {
 		return
 	}
 
@@ -1337,15 +1348,15 @@ Loop:
 		select {
 		// read from link until detach with Close == true is received,
 		// other frames are discarded.
-		case fr := <-l.rx:
+		case fr := <-theLink.rx:
 			if fr, ok := fr.(*performDetach); ok && fr.Closed {
 				return
 			}
 
 		// connection has ended
-		case <-l.session.done:
-			if l.err == nil {
-				l.err = l.session.err
+		case <-theLink.session.done:
+			if theLink.err == nil {
+				theLink.err = theLink.session.err
 			}
 			return
 		}
@@ -1364,11 +1375,11 @@ type LinkOption func(*link) error
 //
 // Deprecated: use LinkSourceAddress or LinkTargetAddress instead.
 func LinkAddress(source string) LinkOption {
-	return func(l *link) error {
-		if l.receiver != nil {
-			return LinkSourceAddress(source)(l)
+	return func(theLink *link) error {
+		if theLink.receiver != nil {
+			return LinkSourceAddress(source)(theLink)
 		}
-		return LinkTargetAddress(source)(l)
+		return LinkTargetAddress(source)(theLink)
 	}
 }
 
@@ -1387,44 +1398,44 @@ func LinkPropertyInt64(key string, value int64) LinkOption {
 }
 
 func linkProperty(key string, value interface{}) LinkOption {
-	return func(l *link) error {
+	return func(theLink *link) error {
 		if key == "" {
 			return errorNew("link property key must not be empty")
 		}
-		if l.properties == nil {
-			l.properties = make(map[symbol]interface{})
+		if theLink.properties == nil {
+			theLink.properties = make(map[symbol]interface{})
 		}
-		l.properties[symbol(key)] = value
+		theLink.properties[symbol(key)] = value
 		return nil
 	}
 }
 
 // LinkSourceAddress sets the source address.
 func LinkSourceAddress(addr string) LinkOption {
-	return func(l *link) error {
-		if l.source == nil {
-			l.source = new(source)
+	return func(theLink *link) error {
+		if theLink.source == nil {
+			theLink.source = new(source)
 		}
-		l.source.Address = addr
+		theLink.source.Address = addr
 		return nil
 	}
 }
 
 // LinkTargetAddress sets the target address.
 func LinkTargetAddress(addr string) LinkOption {
-	return func(l *link) error {
-		if l.target == nil {
-			l.target = new(target)
+	return func(theLink *link) error {
+		if theLink.target == nil {
+			theLink.target = new(target)
 		}
-		l.target.Address = addr
+		theLink.target.Address = addr
 		return nil
 	}
 }
 
 // LinkAddressDynamic requests a dynamically created address from the server.
 func LinkAddressDynamic() LinkOption {
-	return func(l *link) error {
-		l.dynamicAddr = true
+	return func(theLink *link) error {
+		theLink.dynamicAddr = true
 		return nil
 	}
 }
@@ -1432,12 +1443,12 @@ func LinkAddressDynamic() LinkOption {
 // LinkCredit specifies the maximum number of unacknowledged messages
 // the sender can transmit.
 func LinkCredit(credit uint32) LinkOption {
-	return func(l *link) error {
-		if l.receiver == nil {
+	return func(theLink *link) error {
+		if theLink.receiver == nil {
 			return errorNew("LinkCredit is not valid for Sender")
 		}
 
-		l.receiver.maxCredit = credit
+		theLink.receiver.maxCredit = credit
 		return nil
 	}
 }
@@ -1448,8 +1459,8 @@ func LinkCredit(credit uint32) LinkOption {
 // to the server until the batch is equal to link credit or the
 // batch max age expires.
 func LinkBatching(enable bool) LinkOption {
-	return func(l *link) error {
-		l.receiver.batching = enable
+	return func(theLink *link) error {
+		theLink.receiver.batching = enable
 		return nil
 	}
 }
@@ -1457,8 +1468,8 @@ func LinkBatching(enable bool) LinkOption {
 // LinkBatchMaxAge sets the maximum time between the start
 // of a disposition batch and sending the batch to the server.
 func LinkBatchMaxAge(d time.Duration) LinkOption {
-	return func(l *link) error {
-		l.receiver.batchMaxAge = d
+	return func(theLink *link) error {
+		theLink.receiver.batchMaxAge = d
 		return nil
 	}
 }
@@ -1470,11 +1481,11 @@ func LinkBatchMaxAge(d time.Duration) LinkOption {
 //
 // When the Link is the Sender, this is the actual settlement mode.
 func LinkSenderSettle(mode SenderSettleMode) LinkOption {
-	return func(l *link) error {
+	return func(theLink *link) error {
 		if mode > ModeMixed {
 			return errorErrorf("invalid SenderSettlementMode %d", mode)
 		}
-		l.senderSettleMode = &mode
+		theLink.senderSettleMode = &mode
 		return nil
 	}
 }
@@ -1486,11 +1497,11 @@ func LinkSenderSettle(mode SenderSettleMode) LinkOption {
 //
 // When the Link is the Receiver, this is the actual settlement mode.
 func LinkReceiverSettle(mode ReceiverSettleMode) LinkOption {
-	return func(l *link) error {
+	return func(theLink *link) error {
 		if mode > ModeSecond {
 			return errorErrorf("invalid ReceiverSettlementMode %d", mode)
 		}
-		l.receiverSettleMode = &mode
+		theLink.receiverSettleMode = &mode
 		return nil
 	}
 }
@@ -1511,14 +1522,14 @@ func LinkSelectorFilter(filter string) LinkOption {
 // linkSourceFilter sets a filter on the link source.
 func linkSourceFilter(name string, code uint64, value string) LinkOption {
 	nameSym := symbol(name)
-	return func(l *link) error {
-		if l.source == nil {
-			l.source = new(source)
+	return func(theLink *link) error {
+		if theLink.source == nil {
+			theLink.source = new(source)
 		}
-		if l.source.Filter == nil {
-			l.source.Filter = make(map[symbol]*describedType)
+		if theLink.source.Filter == nil {
+			theLink.source.Filter = make(map[symbol]*describedType)
 		}
-		l.source.Filter[nameSym] = &describedType{
+		theLink.source.Filter[nameSym] = &describedType{
 			descriptor: code,
 			value:      value,
 		}
@@ -1533,8 +1544,8 @@ func linkSourceFilter(name string, code uint64, value string) LinkOption {
 //
 // Default: 0.
 func LinkMaxMessageSize(size uint64) LinkOption {
-	return func(l *link) error {
-		l.maxMessageSize = size
+	return func(theLink *link) error {
+		theLink.maxMessageSize = size
 		return nil
 	}
 }
@@ -1552,10 +1563,10 @@ type Receiver struct {
 // Receive returns the next message from the sender.
 //
 // Blocks until a message is received, ctx completes, or an error occurs.
-func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
-	if atomic.LoadUint32(&r.link.paused) == 1 {
+func (theReceiver *Receiver) Receive(ctx context.Context) (*Message, error) {
+	if atomic.LoadUint32(&theReceiver.link.paused) == 1 {
 		select {
-		case r.link.receiverReady <- struct{}{}:
+		case theReceiver.link.receiverReady <- struct{}{}:
 		default:
 		}
 	}
@@ -1563,8 +1574,8 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// non-blocking receive to ensure buffered messages are
 	// delivered regardless of whether the link has been closed.
 	select {
-	case msg := <-r.link.messages:
-		msg.receiver = r
+	case msg := <-theReceiver.link.messages:
+		msg.receiver = theReceiver
 		return &msg, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1573,22 +1584,22 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 
 	// wait for the next message
 	select {
-	case msg := <-r.link.messages:
-		msg.receiver = r
+	case msg := <-theReceiver.link.messages:
+		msg.receiver = theReceiver
 		return &msg, nil
-	case <-r.link.done:
-		return nil, r.link.err
+	case <-theReceiver.link.done:
+		return nil, theReceiver.link.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
 // Address returns the link's address.
-func (r *Receiver) Address() string {
-	if r.link.source == nil {
+func (theReceiver *Receiver) Address() string {
+	if theReceiver.link.source == nil {
 		return ""
 	}
-	return r.link.source.Address
+	return theReceiver.link.source.Address
 }
 
 // Close closes the Receiver and AMQP link.
@@ -1596,8 +1607,8 @@ func (r *Receiver) Address() string {
 // If ctx expires while waiting for servers response, ctx.Err() will be returned.
 // The session will continue to wait for the response until the Session or Client
 // is closed.
-func (r *Receiver) Close(ctx context.Context) error {
-	return r.link.Close(ctx)
+func (theReceiver *Receiver) Close(ctx context.Context) error {
+	return theReceiver.link.Close(ctx)
 }
 
 type messageDisposition struct {
@@ -1605,7 +1616,7 @@ type messageDisposition struct {
 	state interface{}
 }
 
-func (r *Receiver) dispositionBatcher() {
+func (theReceiver *Receiver) dispositionBatcher() {
 	// batch operations:
 	// Keep track of the first and last delivery ID, incrementing as
 	// Accept() is called. After last-first == batchSize, send disposition.
@@ -1613,7 +1624,7 @@ func (r *Receiver) dispositionBatcher() {
 	// accepted, and one for the rejected/released message. If messages are
 	// accepted out of order, send any existing batch and the current message.
 	var (
-		batchSize    = r.maxCredit
+		batchSize    = theReceiver.maxCredit
 		batchStarted bool
 		first        uint32
 		last         uint32
@@ -1626,7 +1637,7 @@ func (r *Receiver) dispositionBatcher() {
 
 	for {
 		select {
-		case msgDis := <-r.dispositions:
+		case msgDis := <-theReceiver.dispositions:
 
 			// not accepted or batch out of order
 			_, isAccept := msgDis.state.(*stateAccepted)
@@ -1634,17 +1645,17 @@ func (r *Receiver) dispositionBatcher() {
 				// send the current batch, if any
 				if batchStarted {
 					lastCopy := last
-					err := r.sendDisposition(first, &lastCopy, &stateAccepted{})
+					err := theReceiver.sendDisposition(first, &lastCopy, &stateAccepted{})
 					if err != nil {
-						r.inFlight.remove(first, &lastCopy, err)
+						theReceiver.inFlight.remove(first, &lastCopy, err)
 					}
 					batchStarted = false
 				}
 
 				// send the current message
-				err := r.sendDisposition(msgDis.id, nil, msgDis.state)
+				err := theReceiver.sendDisposition(msgDis.id, nil, msgDis.state)
 				if err != nil {
-					r.inFlight.remove(msgDis.id, nil, err)
+					theReceiver.inFlight.remove(msgDis.id, nil, err)
 				}
 				continue
 			}
@@ -1657,15 +1668,15 @@ func (r *Receiver) dispositionBatcher() {
 				batchStarted = true
 				first = msgDis.id
 				last = msgDis.id
-				batchTimer.Reset(r.batchMaxAge)
+				batchTimer.Reset(theReceiver.batchMaxAge)
 			}
 
 			// send batch if current size == batchSize
 			if last-first+1 >= batchSize {
 				lastCopy := last
-				err := r.sendDisposition(first, &lastCopy, &stateAccepted{})
+				err := theReceiver.sendDisposition(first, &lastCopy, &stateAccepted{})
 				if err != nil {
-					r.inFlight.remove(first, &lastCopy, err)
+					theReceiver.inFlight.remove(first, &lastCopy, err)
 				}
 				batchStarted = false
 				if !batchTimer.Stop() {
@@ -1676,43 +1687,43 @@ func (r *Receiver) dispositionBatcher() {
 		// maxBatchAge elapsed, send batch
 		case <-batchTimer.C:
 			lastCopy := last
-			err := r.sendDisposition(first, &lastCopy, &stateAccepted{})
+			err := theReceiver.sendDisposition(first, &lastCopy, &stateAccepted{})
 			if err != nil {
-				r.inFlight.remove(first, &lastCopy, err)
+				theReceiver.inFlight.remove(first, &lastCopy, err)
 			}
 			batchStarted = false
 			batchTimer.Stop()
 
-		case <-r.link.done:
+		case <-theReceiver.link.done:
 			return
 		}
 	}
 }
 
 // sendDisposition sends a disposition frame to the peer
-func (r *Receiver) sendDisposition(first uint32, last *uint32, state interface{}) error {
+func (theReceiver *Receiver) sendDisposition(first uint32, last *uint32, state interface{}) error {
 	fr := &performDisposition{
 		Role:    roleReceiver,
 		First:   first,
 		Last:    last,
-		Settled: r.link.receiverSettleMode == nil || *r.link.receiverSettleMode == ModeFirst,
+		Settled: theReceiver.link.receiverSettleMode == nil || *theReceiver.link.receiverSettleMode == ModeFirst,
 		State:   state,
 	}
 
 	debug(1, "TX: %s", fr)
-	return r.link.session.txFrame(fr, nil)
+	return theReceiver.link.session.txFrame(fr, nil)
 }
 
-func (r *Receiver) messageDisposition(id uint32, state interface{}) error {
+func (theReceiver *Receiver) messageDisposition(id uint32, state interface{}) error {
 	var wait chan error
-	if r.link.receiverSettleMode != nil && *r.link.receiverSettleMode == ModeSecond {
-		wait = r.inFlight.add(id)
+	if theReceiver.link.receiverSettleMode != nil && *theReceiver.link.receiverSettleMode == ModeSecond {
+		wait = theReceiver.inFlight.add(id)
 	}
 
-	if r.batching {
-		r.dispositions <- messageDisposition{id: id, state: state}
+	if theReceiver.batching {
+		theReceiver.dispositions <- messageDisposition{id: id, state: state}
 	} else {
-		err := r.sendDisposition(id, nil, state)
+		err := theReceiver.sendDisposition(id, nil, state)
 		if err != nil {
 			return err
 		}
@@ -1733,25 +1744,25 @@ type inFlight struct {
 	m  map[uint32]chan error
 }
 
-func (f *inFlight) add(id uint32) chan error {
+func (inFlightTracker *inFlight) add(id uint32) chan error {
 	wait := make(chan error, 1)
 
-	f.mu.Lock()
-	if f.m == nil {
-		f.m = map[uint32]chan error{id: wait}
+	inFlightTracker.mu.Lock()
+	if inFlightTracker.m == nil {
+		inFlightTracker.m = map[uint32]chan error{id: wait}
 	} else {
-		f.m[id] = wait
+		inFlightTracker.m[id] = wait
 	}
-	f.mu.Unlock()
+	inFlightTracker.mu.Unlock()
 
 	return wait
 }
 
-func (f *inFlight) remove(first uint32, last *uint32, err error) {
-	f.mu.Lock()
+func (inFlightTracker *inFlight) remove(first uint32, last *uint32, err error) {
+	inFlightTracker.mu.Lock()
 
-	if f.m == nil {
-		f.mu.Unlock()
+	if inFlightTracker.m == nil {
+		inFlightTracker.mu.Unlock()
 		return
 	}
 
@@ -1761,23 +1772,23 @@ func (f *inFlight) remove(first uint32, last *uint32, err error) {
 	}
 
 	for i := first; i <= ll; i++ {
-		wait, ok := f.m[i]
+		wait, ok := inFlightTracker.m[i]
 		if ok {
 			wait <- err
-			delete(f.m, i)
+			delete(inFlightTracker.m, i)
 		}
 	}
 
-	f.mu.Unlock()
+	inFlightTracker.mu.Unlock()
 }
 
-func (f *inFlight) clear(err error) {
-	f.mu.Lock()
-	for id, wait := range f.m {
+func (inFlightTracker *inFlight) clear(err error) {
+	inFlightTracker.mu.Lock()
+	for id, wait := range inFlightTracker.m {
 		wait <- err
-		delete(f.m, id)
+		delete(inFlightTracker.m, id)
 	}
-	f.mu.Unlock()
+	inFlightTracker.mu.Unlock()
 }
 
 const maxTransferFrameHeader = 66 // determined by calcMaxTransferFrameHeader
