@@ -154,9 +154,9 @@ type protoHeader struct {
 
 // frame is the decoded representation of a frame
 type frame struct {
-	type_   uint8     // AMQP/SASL
-	channel uint16    // channel this frame is for
-	body    frameBody // body of the frame
+	decodedType uint8     // AMQP/SASL
+	channel     uint16    // channel this frame is for
+	body        frameBody // body of the frame
 
 	// optional channel which will be closed after net transmit
 	done chan deliveryState
@@ -1878,7 +1878,7 @@ func (m *Message) unmarshal(r *buffer) error {
 	// loop, decoding sections until bytes have been consumed
 	for r.len() > 0 {
 		// determine type
-		type_, err := peekMessageType(r.bytes())
+		decodedType, err := peekMessageType(r.bytes())
 		if err != nil {
 			return err
 		}
@@ -1889,7 +1889,7 @@ func (m *Message) unmarshal(r *buffer) error {
 			// unmarshaling section is set to true
 			discardHeader = true
 		)
-		switch amqpType(type_) {
+		switch amqpType(decodedType) {
 
 		case typeCodeMessageHeader:
 			discardHeader = false
@@ -1927,7 +1927,7 @@ func (m *Message) unmarshal(r *buffer) error {
 			section = &m.Value
 
 		default:
-			return errorErrorf("unknown message section %#02x", type_)
+			return errorErrorf("unknown message section %#02x", decodedType)
 		}
 
 		if discardHeader {
@@ -2791,12 +2791,12 @@ func (a *ArrayUByte) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeUbyte {
-		return errorErrorf("invalid type for []uint16 %02x", type_)
+	if decodedType != typeCodeUbyte {
+		return errorErrorf("invalid type for []uint16 %02x", decodedType)
 	}
 
 	buf, ok := r.next(length)
@@ -2828,12 +2828,12 @@ func (a *arrayInt8) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeByte {
-		return errorErrorf("invalid type for []uint16 %02x", type_)
+	if decodedType != typeCodeByte {
+		return errorErrorf("invalid type for []uint16 %02x", decodedType)
 	}
 
 	buf, ok := r.next(length)
@@ -2876,12 +2876,12 @@ func (a *arrayUint16) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeUshort {
-		return errorErrorf("invalid type for []uint16 %02x", type_)
+	if decodedType != typeCodeUshort {
+		return errorErrorf("invalid type for []uint16 %02x", decodedType)
 	}
 
 	const typeSize = 2
@@ -2927,12 +2927,12 @@ func (a *arrayInt16) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeShort {
-		return errorErrorf("invalid type for []uint16 %02x", type_)
+	if decodedType != typeCodeShort {
+		return errorErrorf("invalid type for []uint16 %02x", decodedType)
 	}
 
 	const typeSize = 2
@@ -2996,11 +2996,11 @@ func (a *arrayUint32) unmarshal(r *buffer) error {
 
 	aa := (*a)[:0]
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeUint0:
 		if int64(cap(aa)) < length {
 			aa = make([]uint32, length)
@@ -3044,7 +3044,7 @@ func (a *arrayUint32) unmarshal(r *buffer) error {
 			bufIdx += 4
 		}
 	default:
-		return errorErrorf("invalid type for []uint32 %02x", type_)
+		return errorErrorf("invalid type for []uint32 %02x", decodedType)
 	}
 
 	*a = aa
@@ -3089,11 +3089,11 @@ func (a *arrayInt32) unmarshal(r *buffer) error {
 
 	aa := (*a)[:0]
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeSmallint:
 		buf, ok := r.next(length)
 		if !ok {
@@ -3128,7 +3128,7 @@ func (a *arrayInt32) unmarshal(r *buffer) error {
 			bufIdx += 4
 		}
 	default:
-		return errorErrorf("invalid type for []int32 %02x", type_)
+		return errorErrorf("invalid type for []int32 %02x", decodedType)
 	}
 
 	*a = aa
@@ -3173,11 +3173,11 @@ func (a *arrayUint64) unmarshal(r *buffer) error {
 
 	aa := (*a)[:0]
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeUlong0:
 		if int64(cap(aa)) < length {
 			aa = make([]uint64, length)
@@ -3221,7 +3221,7 @@ func (a *arrayUint64) unmarshal(r *buffer) error {
 			bufIdx += 8
 		}
 	default:
-		return errorErrorf("invalid type for []uint64 %02x", type_)
+		return errorErrorf("invalid type for []uint64 %02x", decodedType)
 	}
 
 	*a = aa
@@ -3266,11 +3266,11 @@ func (a *arrayInt64) unmarshal(r *buffer) error {
 
 	aa := (*a)[:0]
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeSmalllong:
 		buf, ok := r.next(length)
 		if !ok {
@@ -3305,7 +3305,7 @@ func (a *arrayInt64) unmarshal(r *buffer) error {
 			bufIdx += 8
 		}
 	default:
-		return errorErrorf("invalid type for []uint64 %02x", type_)
+		return errorErrorf("invalid type for []uint64 %02x", decodedType)
 	}
 
 	*a = aa
@@ -3332,12 +3332,12 @@ func (a *arrayFloat) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeFloat {
-		return errorErrorf("invalid type for []float32 %02x", type_)
+	if decodedType != typeCodeFloat {
+		return errorErrorf("invalid type for []float32 %02x", decodedType)
 	}
 
 	const typeSize = 4
@@ -3384,12 +3384,12 @@ func (a *arrayDouble) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeDouble {
-		return errorErrorf("invalid type for []float64 %02x", type_)
+	if decodedType != typeCodeDouble {
+		return errorErrorf("invalid type for []float64 %02x", decodedType)
 	}
 
 	const typeSize = 8
@@ -3447,11 +3447,11 @@ func (a *arrayBool) unmarshal(r *buffer) error {
 		aa = aa[:length]
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeBool:
 		buf, ok := r.next(length)
 		if !ok {
@@ -3475,7 +3475,7 @@ func (a *arrayBool) unmarshal(r *buffer) error {
 			aa[i] = false
 		}
 	default:
-		return errorErrorf("invalid type for []bool %02x", type_)
+		return errorErrorf("invalid type for []bool %02x", decodedType)
 	}
 
 	*a = aa
@@ -3536,11 +3536,11 @@ func (a *arrayString) unmarshal(r *buffer) error {
 		aa = aa[:length]
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeStr8:
 		for i := range aa {
 			size, err := r.readByte()
@@ -3570,7 +3570,7 @@ func (a *arrayString) unmarshal(r *buffer) error {
 			aa[i] = string(buf)
 		}
 	default:
-		return errorErrorf("invalid type for []string %02x", type_)
+		return errorErrorf("invalid type for []string %02x", decodedType)
 	}
 
 	*a = aa
@@ -3627,11 +3627,11 @@ func (a *arraySymbol) unmarshal(r *buffer) error {
 		aa = aa[:length]
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeSym8:
 		for i := range aa {
 			size, err := r.readByte()
@@ -3660,7 +3660,7 @@ func (a *arraySymbol) unmarshal(r *buffer) error {
 			aa[i] = symbol(buf)
 		}
 	default:
-		return errorErrorf("invalid type for []symbol %02x", type_)
+		return errorErrorf("invalid type for []symbol %02x", decodedType)
 	}
 
 	*a = aa
@@ -3717,11 +3717,11 @@ func (a *arrayBinary) unmarshal(r *buffer) error {
 		aa = aa[:length]
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	switch type_ {
+	switch decodedType {
 	case typeCodeVbin8:
 		for i := range aa {
 			size, err := r.readByte()
@@ -3750,7 +3750,7 @@ func (a *arrayBinary) unmarshal(r *buffer) error {
 			aa[i] = append([]byte(nil), buf...)
 		}
 	default:
-		return errorErrorf("invalid type for [][]byte %02x", type_)
+		return errorErrorf("invalid type for [][]byte %02x", decodedType)
 	}
 
 	*a = aa
@@ -3778,12 +3778,12 @@ func (a *arrayTimestamp) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeTimestamp {
-		return errorErrorf("invalid type for []time.Time %02x", type_)
+	if decodedType != typeCodeTimestamp {
+		return errorErrorf("invalid type for []time.Time %02x", decodedType)
 	}
 
 	const typeSize = 8
@@ -3830,12 +3830,12 @@ func (a *arrayUUID) unmarshal(r *buffer) error {
 		return err
 	}
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return err
 	}
-	if type_ != typeCodeUUID {
-		return errorErrorf("invalid type for []UUID %#02x", type_)
+	if decodedType != typeCodeUUID {
+		return errorErrorf("invalid type for []UUID %#02x", decodedType)
 	}
 
 	const typeSize = 16
@@ -3932,12 +3932,12 @@ func (ms multiSymbol) marshal(wr *buffer) error {
 }
 
 func (ms *multiSymbol) unmarshal(r *buffer) error {
-	type_, err := r.peekType()
+	decodedType, err := r.peekType()
 	if err != nil {
 		return err
 	}
 
-	if type_ == typeCodeSym8 || type_ == typeCodeSym32 {
+	if decodedType == typeCodeSym8 || decodedType == typeCodeSym32 {
 		s, err := readString(r)
 		if err != nil {
 			return err

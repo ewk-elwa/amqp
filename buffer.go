@@ -41,9 +41,9 @@ func (b *buffer) readByte() (byte, error) {
 		return 0, io.EOF
 	}
 
-	byte_ := b.b[b.i]
+	aByte := b.b[b.i]
 	b.i++
-	return byte_, nil
+	return aByte, nil
 }
 
 func (b *buffer) readType() (amqpType, error) {
@@ -108,8 +108,8 @@ func (b *buffer) write(p []byte) {
 	b.b = append(b.b, p...)
 }
 
-func (b *buffer) writeByte(byte_ byte) {
-	b.b = append(b.b, byte_)
+func (b *buffer) writeByte(aByte byte) {
+	b.b = append(b.b, aByte)
 }
 
 func (b *buffer) writeString(s string) {

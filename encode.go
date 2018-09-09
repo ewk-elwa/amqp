@@ -12,8 +12,8 @@ func writeFrame(buf *buffer, fr frame) error {
 	// write header
 	buf.write([]byte{
 		0, 0, 0, 0, // size, overwrite later
-		2,        // doff, see frameHeader.DataOffset comment
-		fr.type_, // frame type
+		2,              // doff, see frameHeader.DataOffset comment
+		fr.decodedType, // frame type
 	})
 	buf.writeUint16(fr.channel) // channel
 
@@ -551,7 +551,7 @@ const (
 	array32TLSize = 5
 )
 
-func writeArrayHeader(wr *buffer, length, typeSize int, type_ amqpType) {
+func writeArrayHeader(wr *buffer, length, typeSize int, theAmqpType amqpType) {
 	size := length * typeSize
 
 	// array type
@@ -560,21 +560,21 @@ func writeArrayHeader(wr *buffer, length, typeSize int, type_ amqpType) {
 			byte(typeCodeArray8),      // type
 			byte(size + array8TLSize), // size
 			byte(length),              // length
-			byte(type_),               // element type
+			byte(theAmqpType),         // element type
 		})
 	} else {
 		wr.writeByte(byte(typeCodeArray32))          //type
 		wr.writeUint32(uint32(size + array32TLSize)) // size
 		wr.writeUint32(uint32(length))               // length
-		wr.writeByte(byte(type_))                    // element type
+		wr.writeByte(byte(theAmqpType))              // element type
 	}
 }
 
-func writeVariableArrayHeader(wr *buffer, length, elementsSizeTotal int, type_ amqpType) {
+func writeVariableArrayHeader(wr *buffer, length, elementsSizeTotal int, theAmqpType amqpType) {
 	// 0xA_ == 1, 0xB_ == 4
 	// http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-types-v1.0-os.html#doc-idp82960
 	elementTypeSize := 1
-	if type_&0xf0 == 0xb0 {
+	if theAmqpType&0xf0 == 0xb0 {
 		elementTypeSize = 4
 	}
 
@@ -584,12 +584,12 @@ func writeVariableArrayHeader(wr *buffer, length, elementsSizeTotal int, type_ a
 			byte(typeCodeArray8),      // type
 			byte(size + array8TLSize), // size
 			byte(length),              // length
-			byte(type_),               // element type
+			byte(theAmqpType),         // element type
 		})
 	} else {
 		wr.writeByte(byte(typeCodeArray32))          // type
 		wr.writeUint32(uint32(size + array32TLSize)) // size
 		wr.writeUint32(uint32(length))               // length
-		wr.writeByte(byte(type_))                    // element type
+		wr.writeByte(byte(theAmqpType))              // element type
 	}
 }

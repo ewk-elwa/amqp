@@ -43,7 +43,7 @@ func ConnSASLPlain(username, password string) ConnOption {
 		c.saslHandlers[saslMechanismPLAIN] = func() stateFunc {
 			// send saslInit with PLAIN payload
 			c.err = c.writeFrame(frame{
-				type_: frameTypeSASL,
+				decodedType: frameTypeSASL,
 				body: &saslInit{
 					Mechanism:       "PLAIN",
 					InitialResponse: []byte("\x00" + username + "\x00" + password),
@@ -72,7 +72,7 @@ func ConnSASLAnonymous() ConnOption {
 		// add the handler the the map
 		c.saslHandlers[saslMechanismANONYMOUS] = func() stateFunc {
 			c.err = c.writeFrame(frame{
-				type_: frameTypeSASL,
+				decodedType: frameTypeSASL,
 				body: &saslInit{
 					Mechanism:       saslMechanismANONYMOUS,
 					InitialResponse: []byte("anonymous"),

@@ -20,8 +20,8 @@ var exampleFrames = []struct {
 	{
 		label: "transfer",
 		frame: frame{
-			type_:   frameTypeAMQP,
-			channel: 10,
+			decodedType: frameTypeAMQP,
+			channel:     10,
 			body: &performTransfer{
 				Handle:             34983,
 				DeliveryID:         uint32Ptr(564),
@@ -59,8 +59,8 @@ func TestFrameMarshalUnmarshal(t *testing.T) {
 			if header.Channel != want.channel {
 				t.Errorf("Expected channel to be %d, but it is %d", want.channel, header.Channel)
 			}
-			if header.FrameType != want.type_ {
-				t.Errorf("Expected channel to be %d, but it is %d", want.type_, header.FrameType)
+			if header.FrameType != want.decodedType {
+				t.Errorf("Expected channel to be %d, but it is %d", want.decodedType, header.FrameType)
 			}
 
 			payload, err := parseFrameBody(&buf)
@@ -143,15 +143,15 @@ func BenchmarkMarshal(b *testing.B) {
 }
 
 func BenchmarkUnmarshal(b *testing.B) {
-	for _, type_ := range allTypes {
-		b.Run(fmt.Sprintf("%T", type_), func(b *testing.B) {
+	for _, theType := range allTypes {
+		b.Run(fmt.Sprintf("%T", theType), func(b *testing.B) {
 			var buf buffer
-			err := marshal(&buf, type_)
+			err := marshal(&buf, theType)
 			if err != nil {
 				b.Error(fmt.Sprintf("%+v", err))
 			}
 			data := buf.bytes()
-			newType := reflect.New(reflect.TypeOf(type_)).Interface()
+			newType := reflect.New(reflect.TypeOf(theType)).Interface()
 
 			b.ResetTimer()
 			b.ReportAllocs()
@@ -169,16 +169,16 @@ func BenchmarkUnmarshal(b *testing.B) {
 func TestMarshalUnmarshal(t *testing.T) {
 	_, updateFuzzCorpus := os.LookupEnv("UPDATE_FUZZ_CORPUS")
 
-	for _, type_ := range allTypes {
-		t.Run(fmt.Sprintf("%T", type_), func(t *testing.T) {
+	for _, theType := range allTypes {
+		t.Run(fmt.Sprintf("%T", theType), func(t *testing.T) {
 			var buf buffer
-			err := marshal(&buf, type_)
+			err := marshal(&buf, theType)
 			if err != nil {
 				t.Fatal(fmt.Sprintf("%+v", err))
 			}
 
 			if updateFuzzCorpus {
-				name := fmt.Sprintf("%T.bin", type_)
+				name := fmt.Sprintf("%T.bin", theType)
 				name = strings.TrimPrefix(name, "amqp.")
 				name = strings.TrimPrefix(name, "*amqp.")
 				path := filepath.Join("fuzz/marshal/corpus", name)
@@ -189,7 +189,7 @@ func TestMarshalUnmarshal(t *testing.T) {
 			}
 
 			// handle special case around nil type
-			if type_ == nil {
+			if theType == nil {
 				err = unmarshal(&buf, nil)
 				if err != nil {
 					t.Fatal(fmt.Sprintf("%+v", err))
@@ -198,25 +198,25 @@ func TestMarshalUnmarshal(t *testing.T) {
 				return
 			}
 
-			newType := reflect.New(reflect.TypeOf(type_))
+			newType := reflect.New(reflect.TypeOf(theType))
 			err = unmarshal(&buf, newType.Interface())
 			if err != nil {
 				t.Fatal(fmt.Sprintf("%+v", err))
 				return
 			}
 			cmpType := reflect.Indirect(newType).Interface()
-			if !testEqual(type_, cmpType) {
-				t.Errorf("Roundtrip produced different results:\n %s", testDiff(type_, cmpType))
+			if !testEqual(theType, cmpType) {
+				t.Errorf("Roundtrip produced different results:\n %s", testDiff(theType, cmpType))
 			}
 		})
 	}
 }
 
 func TestReadAny(t *testing.T) {
-	for _, type_ := range generalTypes {
-		t.Run(fmt.Sprintf("%T", type_), func(t *testing.T) {
+	for _, theType := range generalTypes {
+		t.Run(fmt.Sprintf("%T", theType), func(t *testing.T) {
 			var buf buffer
-			err := marshal(&buf, type_)
+			err := marshal(&buf, theType)
 			if err != nil {
 				t.Errorf("%+v", err)
 			}
@@ -226,8 +226,8 @@ func TestReadAny(t *testing.T) {
 				t.Fatalf("%+v", err)
 			}
 
-			if !testEqual(type_, got) {
-				t.Errorf("Roundtrip produced different results:\n %s", testDiff(type_, got))
+			if !testEqual(theType, got) {
+				t.Errorf("Roundtrip produced different results:\n %s", testDiff(theType, got))
 			}
 		})
 	}

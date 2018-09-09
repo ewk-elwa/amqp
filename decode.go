@@ -295,12 +295,12 @@ func unmarshal(r *buffer, i interface{}) error {
 	case *map[symbol]interface{}:
 		return (*mapSymbolAny)(t).unmarshal(r)
 	case *deliveryState:
-		type_, err := peekMessageType(r.bytes())
+		decodedType, err := peekMessageType(r.bytes())
 		if err != nil {
 			return err
 		}
 
-		switch amqpType(type_) {
+		switch amqpType(decodedType) {
 		case typeCodeStateAccepted:
 			*t = new(stateAccepted)
 		case typeCodeStateModified:
@@ -312,7 +312,7 @@ func unmarshal(r *buffer, i interface{}) error {
 		case typeCodeStateReleased:
 			*t = new(stateReleased)
 		default:
-			return errorErrorf("unexpected type %d for deliveryState", type_)
+			return errorErrorf("unexpected type %d for deliveryState", decodedType)
 		}
 		return unmarshal(r, *t)
 
@@ -349,21 +349,21 @@ func unmarshal(r *buffer, i interface{}) error {
 //
 // The composite from r will be unmarshaled into zero or more fields. An error
 // will be returned if typ does not match the decoded type.
-func unmarshalComposite(r *buffer, type_ amqpType, fields ...unmarshalField) error {
+func unmarshalComposite(r *buffer, decodedType amqpType, fields ...unmarshalField) error {
 	cType, numFields, err := readCompositeHeader(r)
 	if err != nil {
 		return err
 	}
 
 	// check type matches expectation
-	if cType != type_ {
-		return errorErrorf("invalid header %#0x for %#0x", cType, type_)
+	if cType != decodedType {
+		return errorErrorf("invalid header %#0x for %#0x", cType, decodedType)
 	}
 
 	// Validate the field count is less than or equal to the number of fields
 	// provided. Fields may be omitted by the sender if they are not set.
 	if numFields > int64(len(fields)) {
-		return errorErrorf("invalid field count %d for %#0x", numFields, type_)
+		return errorErrorf("invalid field count %d for %#0x", numFields, decodedType)
 	}
 
 	for i, field := range fields[:numFields] {
@@ -413,14 +413,14 @@ type nullHandler func() error
 
 // readCompositeHeader reads and consumes the composite header from r.
 func readCompositeHeader(r *buffer) (_ amqpType, fields int64, _ error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, 0, err
 	}
 
 	// compsites always start with 0x0
-	if type_ != 0 {
-		return 0, 0, errorErrorf("invalid composite header %#02x", type_)
+	if decodedType != 0 {
+		return 0, 0, errorErrorf("invalid composite header %#02x", decodedType)
 	}
 
 	// next, the composite type is encoded as an AMQP uint8
@@ -436,14 +436,14 @@ func readCompositeHeader(r *buffer) (_ amqpType, fields int64, _ error) {
 }
 
 func readListHeader(r *buffer) (length int64, _ error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
 	listLength := r.len()
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeList0:
 		return 0, nil
 	case typeCodeList8:
@@ -471,21 +471,21 @@ func readListHeader(r *buffer) (length int64, _ error) {
 		}
 		length = int64(binary.BigEndian.Uint32(buf[4:8]))
 	default:
-		return 0, errorErrorf("type code %#02x is not a recognized list type", type_)
+		return 0, errorErrorf("type code %#02x is not a recognized list type", decodedType)
 	}
 
 	return length, nil
 }
 
 func readArrayHeader(r *buffer) (length int64, _ error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
 	arrayLength := r.len()
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeArray8:
 		buf, ok := r.next(2)
 		if !ok {
@@ -507,23 +507,23 @@ func readArrayHeader(r *buffer) (length int64, _ error) {
 
 		size := binary.BigEndian.Uint32(buf[:4])
 		if int(size) > arrayLength-4 {
-			return 0, errorErrorf("invalid length for type %02x", type_)
+			return 0, errorErrorf("invalid length for type %02x", decodedType)
 		}
 		length = int64(binary.BigEndian.Uint32(buf[4:8]))
 	default:
-		return 0, errorErrorf("type code %#02x is not a recognized array type", type_)
+		return 0, errorErrorf("type code %#02x is not a recognized array type", decodedType)
 	}
 	return length, nil
 }
 
 func readString(r *buffer) (string, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return "", err
 	}
 
 	var length int64
-	switch type_ {
+	switch decodedType {
 	case typeCodeStr8, typeCodeSym8:
 		n, err := r.readByte()
 		if err != nil {
@@ -533,11 +533,11 @@ func readString(r *buffer) (string, error) {
 	case typeCodeStr32, typeCodeSym32:
 		buf, ok := r.next(4)
 		if !ok {
-			return "", errorErrorf("invalid length for type %#02x", type_)
+			return "", errorErrorf("invalid length for type %#02x", decodedType)
 		}
 		length = int64(binary.BigEndian.Uint32(buf))
 	default:
-		return "", errorErrorf("type code %#02x is not a recognized string type", type_)
+		return "", errorErrorf("type code %#02x is not a recognized string type", decodedType)
 	}
 
 	buf, ok := r.next(length)
@@ -548,13 +548,13 @@ func readString(r *buffer) (string, error) {
 }
 
 func readBinary(r *buffer) ([]byte, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return nil, err
 	}
 
 	var length int64
-	switch type_ {
+	switch decodedType {
 	case typeCodeVbin8:
 		n, err := r.readByte()
 		if err != nil {
@@ -564,11 +564,11 @@ func readBinary(r *buffer) ([]byte, error) {
 	case typeCodeVbin32:
 		buf, ok := r.next(4)
 		if !ok {
-			return nil, errorErrorf("invalid length for type %#02x", type_)
+			return nil, errorErrorf("invalid length for type %#02x", decodedType)
 		}
 		length = int64(binary.BigEndian.Uint32(buf))
 	default:
-		return nil, errorErrorf("type code %#02x is not a recognized binary type", type_)
+		return nil, errorErrorf("type code %#02x is not a recognized binary type", decodedType)
 	}
 
 	buf, ok := r.next(length)
@@ -583,12 +583,12 @@ func readAny(r *buffer) (interface{}, error) {
 		return nil, nil
 	}
 
-	type_, err := r.peekType()
+	decodedType, err := r.peekType()
 	if err != nil {
 		return nil, errorNew("invalid length")
 	}
 
-	switch type_ {
+	switch decodedType {
 	// composite
 	case 0x0:
 		return readComposite(r)
@@ -675,7 +675,7 @@ func readAny(r *buffer) (interface{}, error) {
 	case typeCodeChar:
 		return nil, errorNew("char not implemented")
 	default:
-		return nil, errorErrorf("unknown type %#02x", type_)
+		return nil, errorErrorf("unknown type %#02x", decodedType)
 	}
 }
 
@@ -930,13 +930,13 @@ func readComposite(r *buffer) (interface{}, error) {
 }
 
 func readTimestamp(r *buffer) (time.Time, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	if type_ != typeCodeTimestamp {
-		return time.Time{}, errorErrorf("invalid type for timestamp %02x", type_)
+	if decodedType != typeCodeTimestamp {
+		return time.Time{}, errorErrorf("invalid type for timestamp %02x", decodedType)
 	}
 
 	n, err := r.readUint64()
@@ -945,12 +945,12 @@ func readTimestamp(r *buffer) (time.Time, error) {
 }
 
 func readInt(r *buffer) (int, error) {
-	type_, err := r.peekType()
+	decodedType, err := r.peekType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	// Unsigned
 	case typeCodeUbyte:
 		n, err := readUbyte(r)
@@ -979,17 +979,17 @@ func readInt(r *buffer) (int, error) {
 		n, err := readLong(r)
 		return int(n), err
 	default:
-		return 0, errorErrorf("type code %#02x is not a recognized number type", type_)
+		return 0, errorErrorf("type code %#02x is not a recognized number type", decodedType)
 	}
 }
 
 func readLong(r *buffer) (int64, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeSmalllong:
 		n, err := r.readByte()
 		return int64(n), err
@@ -997,17 +997,17 @@ func readLong(r *buffer) (int64, error) {
 		n, err := r.readUint64()
 		return int64(n), err
 	default:
-		return 0, errorErrorf("invalid type for uint32 %02x", type_)
+		return 0, errorErrorf("invalid type for uint32 %02x", decodedType)
 	}
 }
 
 func readInt32(r *buffer) (int32, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeSmallint:
 		n, err := r.readByte()
 		return int32(n), err
@@ -1015,18 +1015,18 @@ func readInt32(r *buffer) (int32, error) {
 		n, err := r.readUint32()
 		return int32(n), err
 	default:
-		return 0, errorErrorf("invalid type for int32 %02x", type_)
+		return 0, errorErrorf("invalid type for int32 %02x", decodedType)
 	}
 }
 
 func readShort(r *buffer) (int16, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeShort {
-		return 0, errorErrorf("invalid type for short %02x", type_)
+	if decodedType != typeCodeShort {
+		return 0, errorErrorf("invalid type for short %02x", decodedType)
 	}
 
 	n, err := r.readUint16()
@@ -1034,13 +1034,13 @@ func readShort(r *buffer) (int16, error) {
 }
 
 func readSbyte(r *buffer) (int8, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeByte {
-		return 0, errorErrorf("invalid type for int8 %02x", type_)
+	if decodedType != typeCodeByte {
+		return 0, errorErrorf("invalid type for int8 %02x", decodedType)
 	}
 
 	n, err := r.readByte()
@@ -1048,38 +1048,38 @@ func readSbyte(r *buffer) (int8, error) {
 }
 
 func readUbyte(r *buffer) (uint8, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeUbyte {
-		return 0, errorErrorf("invalid type for ubyte %02x", type_)
+	if decodedType != typeCodeUbyte {
+		return 0, errorErrorf("invalid type for ubyte %02x", decodedType)
 	}
 
 	return r.readByte()
 }
 
 func readUshort(r *buffer) (uint16, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeUshort {
-		return 0, errorErrorf("invalid type for ushort %02x", type_)
+	if decodedType != typeCodeUshort {
+		return 0, errorErrorf("invalid type for ushort %02x", decodedType)
 	}
 
 	return r.readUint16()
 }
 
 func readUint32(r *buffer) (uint32, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeUint0:
 		return 0, nil
 	case typeCodeSmallUint:
@@ -1088,17 +1088,17 @@ func readUint32(r *buffer) (uint32, error) {
 	case typeCodeUint:
 		return r.readUint32()
 	default:
-		return 0, errorErrorf("invalid type for uint32 %02x", type_)
+		return 0, errorErrorf("invalid type for uint32 %02x", decodedType)
 	}
 }
 
 func readUlong(r *buffer) (uint64, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeUlong0:
 		return 0, nil
 	case typeCodeSmallUlong:
@@ -1107,18 +1107,18 @@ func readUlong(r *buffer) (uint64, error) {
 	case typeCodeUlong:
 		return r.readUint64()
 	default:
-		return 0, errorErrorf("invalid type for uint32 %02x", type_)
+		return 0, errorErrorf("invalid type for uint32 %02x", decodedType)
 	}
 }
 
 func readFloat(r *buffer) (float32, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeFloat {
-		return 0, errorErrorf("invalid type for float32 %02x", type_)
+	if decodedType != typeCodeFloat {
+		return 0, errorErrorf("invalid type for float32 %02x", decodedType)
 	}
 
 	bits, err := r.readUint32()
@@ -1126,13 +1126,13 @@ func readFloat(r *buffer) (float32, error) {
 }
 
 func readDouble(r *buffer) (float64, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	if type_ != typeCodeDouble {
-		return 0, errorErrorf("invalid type for float64 %02x", type_)
+	if decodedType != typeCodeDouble {
+		return 0, errorErrorf("invalid type for float64 %02x", decodedType)
 	}
 
 	bits, err := r.readUint64()
@@ -1140,12 +1140,12 @@ func readDouble(r *buffer) (float64, error) {
 }
 
 func readBool(r *buffer) (bool, error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return false, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeBool:
 		b, err := r.readByte()
 		return b != 0, err
@@ -1154,17 +1154,17 @@ func readBool(r *buffer) (bool, error) {
 	case typeCodeBoolFalse:
 		return false, nil
 	default:
-		return false, errorErrorf("type code %#02x is not a recognized bool type", type_)
+		return false, errorErrorf("type code %#02x is not a recognized bool type", decodedType)
 	}
 }
 
 func readUint(r *buffer) (value uint64, _ error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeUint0, typeCodeUlong0:
 		return 0, nil
 	case typeCodeUbyte, typeCodeSmallUint, typeCodeSmallUlong:
@@ -1179,20 +1179,20 @@ func readUint(r *buffer) (value uint64, _ error) {
 	case typeCodeUlong:
 		return r.readUint64()
 	default:
-		return 0, errorErrorf("type code %#02x is not a recognized number type", type_)
+		return 0, errorErrorf("type code %#02x is not a recognized number type", decodedType)
 	}
 }
 
 func readUUID(r *buffer) (UUID, error) {
 	var uuid UUID
 
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return uuid, err
 	}
 
-	if type_ != typeCodeUUID {
-		return uuid, errorErrorf("type code %#00x is not a UUID", type_)
+	if decodedType != typeCodeUUID {
+		return uuid, errorErrorf("type code %#00x is not a UUID", decodedType)
 	}
 
 	buf, ok := r.next(16)
@@ -1205,14 +1205,14 @@ func readUUID(r *buffer) (UUID, error) {
 }
 
 func readMapHeader(r *buffer) (count uint32, _ error) {
-	type_, err := r.readType()
+	decodedType, err := r.readType()
 	if err != nil {
 		return 0, err
 	}
 
 	length := r.len()
 
-	switch type_ {
+	switch decodedType {
 	case typeCodeMap8:
 		buf, ok := r.next(2)
 		if !ok {
@@ -1238,7 +1238,7 @@ func readMapHeader(r *buffer) (count uint32, _ error) {
 		}
 		count = binary.BigEndian.Uint32(buf[4:8])
 	default:
-		return 0, errorErrorf("invalid map type %#02x", type_)
+		return 0, errorErrorf("invalid map type %#02x", decodedType)
 	}
 
 	if int(count) > r.len() {

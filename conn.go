@@ -594,8 +594,8 @@ func (c *amqpConnection) connWriter() {
 		case <-c.done:
 			// send close
 			_ = c.writeFrame(frame{
-				type_: frameTypeAMQP,
-				body:  &performClose{},
+				decodedType: frameTypeAMQP,
+				body:        &performClose{},
 			})
 			return
 		}
@@ -773,7 +773,7 @@ func (c *amqpConnection) startTLS() stateFunc {
 func (c *amqpConnection) openAMQP() stateFunc {
 	// send open frame
 	c.err = c.writeFrame(frame{
-		type_: frameTypeAMQP,
+		decodedType: frameTypeAMQP,
 		body: &performOpen{
 			ContainerID:  c.containerID,
 			Hostname:     c.hostname,
