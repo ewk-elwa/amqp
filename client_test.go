@@ -24,7 +24,7 @@ func TestLinkOptions(t *testing.T) {
 				LinkProperty("x-opt-test2", "test2"),
 				LinkProperty("x-opt-test1", "test3"),
 				LinkPropertyInt64("x-opt-test4", 1),
-				LinkSessionFilter("123"),
+				LinkSourceFilter("com.microsoft:session-filter", 0x00000137000000C, "123"),
 			},
 
 			wantSource: &source{
@@ -33,7 +33,7 @@ func TestLinkOptions(t *testing.T) {
 						descriptor: binary.BigEndian.Uint64([]byte{0x00, 0x00, 0x46, 0x8C, 0x00, 0x00, 0x00, 0x04}),
 						value:      "amqp.annotation.x-opt-offset > '100'",
 					},
-					"com.microsoft:session-filter" : {
+					"com.microsoft:session-filter": {
 						descriptor: binary.BigEndian.Uint64([]byte{0x00, 0x00, 0x00, 0x13, 0x70, 0x00, 0x00, 0x0C}),
 						value:      "123",
 					},
@@ -43,6 +43,30 @@ func TestLinkOptions(t *testing.T) {
 				"x-opt-test1": "test3",
 				"x-opt-test2": "test2",
 				"x-opt-test4": int64(1),
+			},
+		},
+		{
+			label: "more-link-filters",
+			opts: []LinkOption{
+				LinkSourceFilter("com.microsoft:session-filter", 0x00000137000000C, nil),
+			},
+
+			wantSource: &source{
+				Filter: map[symbol]*describedType{
+					"com.microsoft:session-filter": {
+						descriptor: binary.BigEndian.Uint64([]byte{0x00, 0x00, 0x00, 0x13, 0x70, 0x00, 0x00, 0x0C}),
+						value:      nil,
+					},
+				},
+			},
+		},
+		{
+			label: "link-source-capabilities",
+			opts: []LinkOption{
+				LinkSourceCapabilities("cap1", "cap2", "cap3"),
+			},
+			wantSource: &source{
+				Capabilities: []symbol{"cap1", "cap2", "cap3"},
 			},
 		},
 	}
@@ -62,5 +86,21 @@ func TestLinkOptions(t *testing.T) {
 				t.Errorf("Link properties don't match expected:\n %s", testDiff(got.properties, tt.wantProperties))
 			}
 		})
+	}
+}
+
+func TestSourceName(t *testing.T) {
+	expectedSourceName := "source-name"
+	opts := []LinkOption{
+		LinkName(expectedSourceName),
+	}
+
+	got, err := newLink(nil, nil, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.key.name != expectedSourceName {
+		t.Errorf("Link Source Name does not match expected: %v got: %v", expectedSourceName, got.key.name)
 	}
 }

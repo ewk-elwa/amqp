@@ -228,6 +228,25 @@ func (o *performOpen) unmarshal(r *buffer) error {
 	}...)
 }
 
+func (o *performOpen) String() string {
+	return fmt.Sprintf("Open{ContainerID : %s, Hostname: %s, MaxFrameSize: %d, "+
+		"ChannelMax: %d, IdleTimeout: %v, "+
+		"OutgoingLocales: %v, IncomingLocales: %v, "+
+		"OfferedCapabilities: %v, DesiredCapabilities: %v, "+
+		"Properties: %v}",
+		o.ContainerID,
+		o.Hostname,
+		o.MaxFrameSize,
+		o.ChannelMax,
+		o.IdleTimeout,
+		o.OutgoingLocales,
+		o.IncomingLocales,
+		o.OfferedCapabilities,
+		o.DesiredCapabilities,
+		o.Properties,
+	)
+}
+
 /*
 <type name="begin" class="composite" source="list" provides="frame">
     <descriptor name="amqp:begin:list" code="0x00000000:0x00000011"/>
@@ -246,7 +265,7 @@ type performBegin struct {
 	// If a session is locally initiated, the remote-channel MUST NOT be set.
 	// When an endpoint responds to a remotely initiated session, the remote-channel
 	// MUST be set to the channel on which the remote session sent the begin.
-	RemoteChannel uint16
+	RemoteChannel *uint16
 
 	// the transfer-id of the first transfer id the sender will send
 	NextOutgoingID uint32 // required, sequence number http://www.ietf.org/rfc/rfc1982.txt
@@ -282,10 +301,10 @@ type performBegin struct {
 func (b *performBegin) frameBody() {}
 
 func (b *performBegin) String() string {
-	return fmt.Sprintf("Begin{RemoteChannel: %d, NextOutgoingID: %d, IncomingWindow: %d, "+
+	return fmt.Sprintf("Begin{RemoteChannel: %v, NextOutgoingID: %d, IncomingWindow: %d, "+
 		"OutgoingWindow: %d, HandleMax: %d, OfferedCapabilities: %v, DesiredCapabilities: %v, "+
 		"Properties: %v}",
-		b.RemoteChannel,
+		formatUint16Ptr(b.RemoteChannel),
 		b.NextOutgoingID,
 		b.IncomingWindow,
 		b.OutgoingWindow,
@@ -296,9 +315,16 @@ func (b *performBegin) String() string {
 	)
 }
 
+func formatUint16Ptr(p *uint16) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return strconv.FormatUint(uint64(*p), 10)
+}
+
 func (b *performBegin) marshal(wr *buffer) error {
 	return marshalComposite(wr, typeCodeBegin, []marshalField{
-		{value: &b.RemoteChannel, omit: b.RemoteChannel == 0},
+		{value: b.RemoteChannel, omit: b.RemoteChannel == nil},
 		{value: &b.NextOutgoingID, omit: false},
 		{value: &b.IncomingWindow, omit: false},
 		{value: &b.OutgoingWindow, omit: false},
@@ -656,7 +682,7 @@ type source struct {
 	// 0: none
 	// 1: configuration
 	// 2: unsettled-state
-	Durable uint32
+	Durable Durability
 
 	// the expiry policy of the source
 	//
@@ -666,7 +692,7 @@ type source struct {
 	// connection-close: The expiry timer starts when most recently associated connection
 	//                   is closed.
 	// never: The terminus never expires.
-	ExpiryPolicy symbol
+	ExpiryPolicy ExpiryPolicy
 
 	// duration that an expiring source will be retained
 	//
@@ -754,8 +780,8 @@ type source struct {
 func (s *source) marshal(wr *buffer) error {
 	return marshalComposite(wr, typeCodeSource, []marshalField{
 		{value: &s.Address, omit: s.Address == ""},
-		{value: &s.Durable, omit: s.Durable == 0},
-		{value: &s.ExpiryPolicy, omit: s.ExpiryPolicy == ""},
+		{value: &s.Durable, omit: s.Durable == DurabilityNone},
+		{value: &s.ExpiryPolicy, omit: s.ExpiryPolicy == "" || s.ExpiryPolicy == ExpirySessionEnd},
 		{value: &s.Timeout, omit: s.Timeout == 0},
 		{value: &s.Dynamic, omit: !s.Dynamic},
 		{value: s.DynamicNodeProperties, omit: len(s.DynamicNodeProperties) == 0},
@@ -771,7 +797,7 @@ func (s *source) unmarshal(r *buffer) error {
 	return unmarshalComposite(r, typeCodeSource, []unmarshalField{
 		{field: &s.Address},
 		{field: &s.Durable},
-		{field: &s.ExpiryPolicy, handleNull: func() error { s.ExpiryPolicy = "session-end"; return nil }},
+		{field: &s.ExpiryPolicy, handleNull: func() error { s.ExpiryPolicy = ExpirySessionEnd; return nil }},
 		{field: &s.Timeout},
 		{field: &s.Dynamic},
 		{field: &s.DynamicNodeProperties},
@@ -836,7 +862,7 @@ type target struct {
 	// 0: none
 	// 1: configuration
 	// 2: unsettled-state
-	Durable uint32
+	Durable Durability
 
 	// the expiry policy of the target
 	//
@@ -846,7 +872,7 @@ type target struct {
 	// connection-close: The expiry timer starts when most recently associated connection
 	//                   is closed.
 	// never: The terminus never expires.
-	ExpiryPolicy symbol
+	ExpiryPolicy ExpiryPolicy
 
 	// duration that an expiring target will be retained
 	//
@@ -901,8 +927,8 @@ type target struct {
 func (t *target) marshal(wr *buffer) error {
 	return marshalComposite(wr, typeCodeTarget, []marshalField{
 		{value: &t.Address, omit: t.Address == ""},
-		{value: &t.Durable, omit: t.Durable == 0},
-		{value: &t.ExpiryPolicy, omit: t.ExpiryPolicy == ""},
+		{value: &t.Durable, omit: t.Durable == DurabilityNone},
+		{value: &t.ExpiryPolicy, omit: t.ExpiryPolicy == "" || t.ExpiryPolicy == ExpirySessionEnd},
 		{value: &t.Timeout, omit: t.Timeout == 0},
 		{value: &t.Dynamic, omit: !t.Dynamic},
 		{value: t.DynamicNodeProperties, omit: len(t.DynamicNodeProperties) == 0},
@@ -914,7 +940,7 @@ func (t *target) unmarshal(r *buffer) error {
 	return unmarshalComposite(r, typeCodeTarget, []unmarshalField{
 		{field: &t.Address},
 		{field: &t.Durable},
-		{field: &t.ExpiryPolicy, handleNull: func() error { t.ExpiryPolicy = "session-end"; return nil }},
+		{field: &t.ExpiryPolicy, handleNull: func() error { t.ExpiryPolicy = ExpirySessionEnd; return nil }},
 		{field: &t.Timeout},
 		{field: &t.Dynamic},
 		{field: &t.DynamicNodeProperties},
@@ -1262,21 +1288,21 @@ type performTransfer struct {
 	Payload []byte
 
 	// optional channel to indicate to sender that transfer has completed
+	//
+	// Settled=true: closed when the transferred on network.
+	// Settled=false: closed when the receiver has confirmed settlement.
 	done chan deliveryState
-	// complete when receiver has responded with disposition (ReceiverSettleMode = second)
-	// instead of when this message has been sent on network
-	confirmSettlement bool
 }
 
 func (t *performTransfer) frameBody() {}
 
 func (t performTransfer) String() string {
 	deliveryTag := "<nil>"
-	if t.DeliveryID != nil {
-		deliveryTag = string(t.DeliveryTag)
+	if t.DeliveryTag != nil {
+		deliveryTag = fmt.Sprintf("%q", t.DeliveryTag)
 	}
 
-	return fmt.Sprintf("Transfer{Handle: %d, DeliveryID: %s, DeliveryTag: %q, MessageFormat: %s, "+
+	return fmt.Sprintf("Transfer{Handle: %d, DeliveryID: %s, DeliveryTag: %s, MessageFormat: %s, "+
 		"Settled: %t, More: %t, ReceiverSettleMode: %s, State: %v, Resume: %t, Aborted: %t, "+
 		"Batchable: %t, Payload [size]: %d}",
 		t.Handle,
@@ -1632,8 +1658,10 @@ func (c *performClose) unmarshal(r *buffer) error {
 }
 
 func (c *performClose) String() string {
-	return fmt.Sprintf("*performClose{Error: %s}", c.Error)
+	return fmt.Sprintf("Close{Error: %s}", c.Error)
 }
+
+const maxDeliveryTagLength = 32
 
 // Message is an AMQP message.
 type Message struct {
@@ -1643,6 +1671,9 @@ type Message struct {
 	// format. The lowest octet indicates the version of said message format. Any
 	// given version of a format is forwards compatible with all higher versions.
 	Format uint32
+
+	// The DeliveryTag can be up to 32 octets of binary data.
+	DeliveryTag []byte
 
 	// The header section carries standard delivery details about the transfer
 	// of a message through the AMQP network.
@@ -1721,6 +1752,11 @@ type Message struct {
 	// encryption details).
 	Footer Annotations
 
+	// Mark the message as settled when LinkSenderSettle is ModeMixed.
+	//
+	// This field is ignored when LinkSenderSettle is not ModeMixed.
+	SendSettled bool
+
 	receiver   *Receiver // Receiver the message was received from
 	deliveryID uint32    // used when sending disposition
 	settled    bool      // whether transfer was settled by sender
@@ -1768,7 +1804,7 @@ func (m *Message) Reject(e *Error) error {
 // Release releases the message back to the server. The message
 // may be redelivered to this or another consumer.
 func (m *Message) Release() error {
-	if m.shouldSendDisposition() {
+	if !m.shouldSendDisposition() {
 		return nil
 	}
 	return m.receiver.messageDisposition(m.deliveryID, &stateReleased{})
@@ -1797,7 +1833,7 @@ func (m *Message) Modify(deliveryFailed, undeliverableHere bool, messageAnnotati
 	})
 }
 
-// MarshalBinary encodes the message into binary form
+// MarshalBinary encodes the message into binary form.
 func (m *Message) MarshalBinary() ([]byte, error) {
 	buf := new(buffer)
 	err := m.marshal(buf)
@@ -1805,7 +1841,7 @@ func (m *Message) MarshalBinary() ([]byte, error) {
 }
 
 func (m *Message) shouldSendDisposition() bool {
-	return !m.settled || (m.receiver.link.receiverSettleMode != nil && *m.receiver.link.receiverSettleMode == ModeSecond)
+	return !m.settled
 }
 
 func (m *Message) marshal(wr *buffer) error {
@@ -1872,6 +1908,14 @@ func (m *Message) marshal(wr *buffer) error {
 	}
 
 	return nil
+}
+
+// UnmarshalBinary decodes the message from binary form.
+func (m *Message) UnmarshalBinary(data []byte) error {
+	buf := &buffer{
+		b: data,
+	}
+	return m.unmarshal(buf)
 }
 
 func (m *Message) unmarshal(r *buffer) error {
@@ -2394,6 +2438,14 @@ func (si *saslInit) unmarshal(r *buffer) error {
 	}...)
 }
 
+func (si *saslInit) String() string {
+	// Elide the InitialResponse as it may contain a plain text secret.
+	return fmt.Sprintf("SaslInit{Mechanism : %s, InitialResponse: ********, Hostname: %s}",
+		si.Mechanism,
+		si.Hostname,
+	)
+}
+
 /*
 <type name="sasl-mechanisms" class="composite" source="list" provides="sasl-frame">
     <descriptor name="amqp:sasl-mechanisms:list" code="0x00000000:0x00000040"/>
@@ -2417,6 +2469,70 @@ func (sm *saslMechanisms) unmarshal(r *buffer) error {
 	return unmarshalComposite(r, typeCodeSASLMechanism,
 		unmarshalField{field: &sm.Mechanisms, handleNull: func() error { return errorNew("saslMechanisms.Mechanisms is required") }},
 	)
+}
+
+func (sm *saslMechanisms) String() string {
+	return fmt.Sprintf("SaslMechanisms{Mechanisms : %v}",
+		sm.Mechanisms,
+	)
+}
+
+/*
+<type class="composite" name="sasl-challenge" source="list" provides="sasl-frame" label="security mechanism challenge">
+    <descriptor name="amqp:sasl-challenge:list" code="0x00000000:0x00000042"/>
+    <field name="challenge" type="binary" label="security challenge data" mandatory="true"/>
+</type>
+*/
+
+type saslChallenge struct {
+	Challenge []byte
+}
+
+func (sc *saslChallenge) String() string {
+	return fmt.Sprint("Challenge{Challenge: ********}")
+}
+
+func (sc *saslChallenge) frameBody() {}
+
+func (sc *saslChallenge) marshal(wr *buffer) error {
+	return marshalComposite(wr, typeCodeSASLChallenge, []marshalField{
+		{value: &sc.Challenge, omit: false},
+	})
+}
+
+func (sc *saslChallenge) unmarshal(r *buffer) error {
+	return unmarshalComposite(r, typeCodeSASLChallenge, []unmarshalField{
+		{field: &sc.Challenge, handleNull: func() error { return errorNew("saslChallenge.Challenge is required") }},
+	}...)
+}
+
+/*
+<type class="composite" name="sasl-response" source="list" provides="sasl-frame" label="security mechanism response">
+    <descriptor name="amqp:sasl-response:list" code="0x00000000:0x00000043"/>
+    <field name="response" type="binary" label="security response data" mandatory="true"/>
+</type>
+*/
+
+type saslResponse struct {
+	Response []byte
+}
+
+func (sr *saslResponse) String() string {
+	return fmt.Sprint("Response{Response: ********}")
+}
+
+func (sr *saslResponse) frameBody() {}
+
+func (sr *saslResponse) marshal(wr *buffer) error {
+	return marshalComposite(wr, typeCodeSASLResponse, []marshalField{
+		{value: &sr.Response, omit: false},
+	})
+}
+
+func (sr *saslResponse) unmarshal(r *buffer) error {
+	return unmarshalComposite(r, typeCodeSASLResponse, []unmarshalField{
+		{field: &sr.Response, handleNull: func() error { return errorNew("saslResponse.Response is required") }},
+	}...)
 }
 
 /*
@@ -2446,6 +2562,13 @@ func (so *saslOutcome) unmarshal(r *buffer) error {
 		{field: &so.Code, handleNull: func() error { return errorNew("saslOutcome.AdditionalData is required") }},
 		{field: &so.AdditionalData},
 	}...)
+}
+
+func (so *saslOutcome) String() string {
+	return fmt.Sprintf("SaslOutcome{Code : %v, AdditionalData: %v}",
+		so.Code,
+		so.AdditionalData,
+	)
 }
 
 // symbol is an AMQP symbolic string.
@@ -2691,6 +2814,13 @@ func (m *SenderSettleMode) unmarshal(r *buffer) error {
 	return err
 }
 
+func (m *SenderSettleMode) value() SenderSettleMode {
+	if m == nil {
+		return ModeMixed
+	}
+	return *m
+}
+
 // Receiver Settlement Modes
 const (
 	// Receiver will spontaneously settle all incoming transfers.
@@ -2730,6 +2860,113 @@ func (m *ReceiverSettleMode) unmarshal(r *buffer) error {
 	n, err := readUbyte(r)
 	*m = ReceiverSettleMode(n)
 	return err
+}
+
+func (m *ReceiverSettleMode) value() ReceiverSettleMode {
+	if m == nil {
+		return ModeFirst
+	}
+	return *m
+}
+
+// Durability Policies
+const (
+	// No terminus state is retained durably.
+	DurabilityNone Durability = 0
+
+	// Only the existence and configuration of the terminus is
+	// retained durably.
+	DurabilityConfiguration Durability = 1
+
+	// In addition to the existence and configuration of the
+	// terminus, the unsettled state for durable messages is
+	// retained durably.
+	DurabilityUnsettledState Durability = 2
+)
+
+// Durability specifies the durability of a link.
+type Durability uint32
+
+func (d *Durability) String() string {
+	if d == nil {
+		return "<nil>"
+	}
+
+	switch *d {
+	case DurabilityNone:
+		return "none"
+	case DurabilityConfiguration:
+		return "configuration"
+	case DurabilityUnsettledState:
+		return "unsettled-state"
+	default:
+		return fmt.Sprintf("unknown durability %d", *d)
+	}
+}
+
+func (d Durability) marshal(wr *buffer) error {
+	return marshal(wr, uint32(d))
+}
+
+func (d *Durability) unmarshal(r *buffer) error {
+	return unmarshal(r, (*uint32)(d))
+}
+
+// Expiry Policies
+const (
+	// The expiry timer starts when terminus is detached.
+	ExpiryLinkDetach ExpiryPolicy = "link-detach"
+
+	// The expiry timer starts when the most recently
+	// associated session is ended.
+	ExpirySessionEnd ExpiryPolicy = "session-end"
+
+	// The expiry timer starts when most recently associated
+	// connection is closed.
+	ExpiryConnectionClose ExpiryPolicy = "connection-close"
+
+	// The terminus never expires.
+	ExpiryNever ExpiryPolicy = "never"
+)
+
+// ExpiryPolicy specifies when the expiry timer of a terminus
+// starts counting down from the timeout value.
+//
+// If the link is subsequently re-attached before the terminus is expired,
+// then the count down is aborted. If the conditions for the
+// terminus-expiry-policy are subsequently re-met, the expiry timer restarts
+// from its originally configured timeout value.
+type ExpiryPolicy symbol
+
+func (e ExpiryPolicy) validate() error {
+	switch e {
+	case ExpiryLinkDetach,
+		ExpirySessionEnd,
+		ExpiryConnectionClose,
+		ExpiryNever:
+		return nil
+	default:
+		return errorErrorf("unknown expiry-policy %q", e)
+	}
+}
+
+func (e ExpiryPolicy) marshal(wr *buffer) error {
+	return symbol(e).marshal(wr)
+}
+
+func (e *ExpiryPolicy) unmarshal(r *buffer) error {
+	err := unmarshal(r, (*symbol)(e))
+	if err != nil {
+		return err
+	}
+	return e.validate()
+}
+
+func (e *ExpiryPolicy) String() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return string(*e)
 }
 
 type describedType struct {

@@ -23,7 +23,8 @@ var (
 	ErrTimeout = errors.New("amqp: timeout waiting for response")
 
 	// ErrConnClosed is propagated to Session and Senders/Receivers
-	// when Client.Close() is called.
+	// when Client.Close() is called or the server closes the connection
+	// without specifying an error.
 	ErrConnClosed = errors.New("amqp: connection closed")
 )
 
@@ -358,9 +359,21 @@ func (c *conn) mux() {
 			)
 
 			switch body := fr.body.(type) {
+			// Server initiated close.
+			case *performClose:
+				if body.Error != nil {
+					c.err = body.Error
+				} else {
+					c.err = ErrConnClosed
+				}
+				return
+
 			// RemoteChannel should be used when frame is Begin
 			case *performBegin:
-				session, ok = sessionsByChannel[body.RemoteChannel]
+				if body.RemoteChannel == nil {
+					break
+				}
+				session, ok = sessionsByChannel[*body.RemoteChannel]
 				if !ok {
 					break
 				}
@@ -436,8 +449,14 @@ func (c *conn) connReader() {
 	)
 
 	for {
-		if buf.len() == 0 {
+		switch {
+		// Cheaply reuse free buffer space when fully read.
+		case buf.len() == 0:
 			buf.reset()
+
+		// Prevent excessive/unbounded growth by shifting data to beginning of buffer.
+		case int64(buf.i) > int64(c.maxFrameSize):
+			buf.reclaim()
 		}
 
 		// need to read more if buf doesn't contain the complete frame
@@ -549,6 +568,12 @@ func (c *conn) connReader() {
 func (c *conn) connWriter() {
 	defer close(c.txDone)
 
+	// disable write timeout
+	if c.connectTimeout != 0 {
+		c.connectTimeout = 0
+		_ = c.net.SetWriteDeadline(time.Time{})
+	}
+
 	var (
 		// keepalives are sent at a rate of 1/2 idle timeout
 		keepaliveInterval = c.peerIdleTimeout / 2
@@ -593,9 +618,11 @@ func (c *conn) connWriter() {
 		// connection complete
 		case <-c.done:
 			// send close
+			cls := &performClose{}
+			debug(1, "TX: %s", cls)
 			_ = c.writeFrame(frame{
 				type_: frameTypeAMQP,
-				body:  &performClose{},
+				body:  cls,
 			})
 			return
 		}
@@ -617,8 +644,9 @@ func (c *conn) writeFrame(fr frame) error {
 	}
 
 	// validate the frame isn't exceeding peer's max frame size
-	if uint64(c.txBuf.len()) > uint64(c.peerMaxFrameSize) {
-		return errorErrorf("frame larger than peer's max frame size")
+	requiredFrameSize := c.txBuf.len()
+	if uint64(requiredFrameSize) > uint64(c.peerMaxFrameSize) {
+		return errorErrorf("%T frame size %d larger than peer's max frame size", fr, requiredFrameSize, c.peerMaxFrameSize)
 	}
 
 	// write to network
@@ -772,16 +800,18 @@ func (c *conn) startTLS() stateFunc {
 // openAMQP round trips the AMQP open performative
 func (c *conn) openAMQP() stateFunc {
 	// send open frame
+	open := &performOpen{
+		ContainerID:  c.containerID,
+		Hostname:     c.hostname,
+		MaxFrameSize: c.maxFrameSize,
+		ChannelMax:   c.channelMax,
+		IdleTimeout:  c.idleTimeout,
+		Properties:   c.properties,
+	}
+	debug(1, "TX: %s", open)
 	c.err = c.writeFrame(frame{
-		type_: frameTypeAMQP,
-		body: &performOpen{
-			ContainerID:  c.containerID,
-			Hostname:     c.hostname,
-			MaxFrameSize: c.maxFrameSize,
-			ChannelMax:   c.channelMax,
-			IdleTimeout:  c.idleTimeout,
-			Properties:   c.properties,
-		},
+		type_:   frameTypeAMQP,
+		body:    open,
 		channel: 0,
 	})
 	if c.err != nil {
@@ -799,6 +829,7 @@ func (c *conn) openAMQP() stateFunc {
 		c.err = errorErrorf("unexpected frame type %T", fr.body)
 		return nil
 	}
+	debug(1, "RX: %s", o)
 
 	// update peer settings
 	if o.MaxFrameSize > 0 {
@@ -830,6 +861,7 @@ func (c *conn) negotiateSASL() stateFunc {
 		c.err = errorErrorf("unexpected frame type %T", fr.body)
 		return nil
 	}
+	debug(1, "RX: %s", sm)
 
 	// return first match in c.saslHandlers based on order received
 	for _, mech := range sm.Mechanisms {
@@ -860,6 +892,7 @@ func (c *conn) saslOutcome() stateFunc {
 		c.err = errorErrorf("unexpected frame type %T", fr.body)
 		return nil
 	}
+	debug(1, "RX: %s", so)
 
 	// check if auth succeeded
 	if so.Code != codeSASLOK {

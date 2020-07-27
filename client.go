@@ -44,10 +44,9 @@ func Dial(addr string, opts ...ConnOption) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	host, port, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		host = u.Host
-		port = "5672" // use default port values if parse fails
+	host, port := u.Hostname(), u.Port()
+	if port == "" {
+		port = "5672"
 		if u.Scheme == "amqps" {
 			port = "5671"
 		}
@@ -70,13 +69,15 @@ func Dial(addr string, opts ...ConnOption) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	dialer := &net.Dialer{Timeout: c.connectTimeout}
 	switch u.Scheme {
 	case "amqp", "":
-		c.net, err = net.Dial("tcp", host+":"+port)
+		c.net, err = dialer.Dial("tcp", net.JoinHostPort(host, port))
 	case "amqps":
 		c.initTLSConfig()
 		c.tlsNegotiation = false
-		c.net, err = tls.Dial("tcp", host+":"+port, c.tlsConfig)
+		c.net, err = tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, port), c.tlsConfig)
 	default:
 		return nil, errorErrorf("unsupported scheme %q", u.Scheme)
 	}
@@ -274,14 +275,28 @@ func (s *Session) txFrame(p frameBody, done chan deliveryState) error {
 	})
 }
 
-// randBytes returns a base64 encoded string of n bytes.
-//
-// A new random source is created to avoid any issues with seeding
+// lockedRand provides a rand source that is safe for concurrent use.
+type lockedRand struct {
+	mu  sync.Mutex
+	src *rand.Rand
+}
+
+func (r *lockedRand) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.src.Read(p)
+}
+
+// package scoped rand source to avoid any issues with seeding
 // of the global source.
+var pkgRand = &lockedRand{
+	src: rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+
+// randBytes returns a base64 encoded string of n bytes.
 func randString(n int) string {
-	localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
 	b := make([]byte, n)
-	localRand.Read(b)
+	pkgRand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
@@ -356,6 +371,10 @@ func (s *Sender) Send(ctx context.Context, msg *Message) error {
 // send is separated from Send so that the mutex unlock can be deferred without
 // locking the transfer confirmation that happens in Send.
 func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, error) {
+	if len(msg.DeliveryTag) > maxDeliveryTagLength {
+		return nil, errorErrorf("delivery tag is over the allowed %v bytes, len: %v", maxDeliveryTagLength, len(msg.DeliveryTag))
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -372,15 +391,17 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 	var (
 		maxPayloadSize = int64(s.link.session.conn.peerMaxFrameSize) - maxTransferFrameHeader
 		sndSettleMode  = s.link.senderSettleMode
-		rcvSettleMode  = s.link.receiverSettleMode
-		senderSettled  = sndSettleMode != nil && *sndSettleMode == ModeSettled
+		senderSettled  = sndSettleMode != nil && (*sndSettleMode == ModeSettled || (*sndSettleMode == ModeMixed && msg.SendSettled))
 		deliveryID     = atomic.AddUint32(&s.link.session.nextDeliveryID, 1)
 	)
 
-	// use uint64 encoded as []byte as deliveryTag
-	deliveryTag := make([]byte, 8)
-	binary.BigEndian.PutUint64(deliveryTag, s.nextDeliveryTag)
-	s.nextDeliveryTag++
+	deliveryTag := msg.DeliveryTag
+	if len(deliveryTag) == 0 {
+		// use uint64 encoded as []byte as deliveryTag
+		deliveryTag = make([]byte, 8)
+		binary.BigEndian.PutUint64(deliveryTag, s.nextDeliveryTag)
+		s.nextDeliveryTag++
+	}
 
 	fr := performTransfer{
 		Handle:        s.link.handle,
@@ -395,16 +416,16 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 		fr.Payload = append([]byte(nil), buf...)
 		fr.More = s.buf.len() > 0
 		if !fr.More {
+			// SSM=settled: overrides RSM; no acks.
+			// SSM=unsettled: sender should wait for receiver to ack
+			// RSM=first: receiver considers it settled immediately, but must still send ack (SSM=unsettled only)
+			// RSM=second: receiver sends ack and waits for return ack from sender (SSM=unsettled only)
+
 			// mark final transfer as settled when sender mode is settled
 			fr.Settled = senderSettled
 
-			// set done on last frame to be closed after network transmission
-			//
-			// If confirmSettlement is true (ReceiverSettleMode == "second"),
-			// Session.mux will intercept the done channel and close it when the
-			// receiver has confirmed settlement instead of on net transmit.
+			// set done on last frame
 			fr.done = make(chan deliveryState, 1)
-			fr.confirmSettlement = rcvSettleMode != nil && *rcvSettleMode == ModeSecond
 		}
 
 		select {
@@ -448,12 +469,24 @@ func (s *Session) NewSender(opts ...LinkOption) (*Sender, error) {
 }
 
 func (s *Session) mux(remoteBegin *performBegin) {
-	defer close(s.done)
+	defer func() {
+		// clean up session record in conn.mux()
+		select {
+		case s.conn.delSession <- s:
+		case <-s.conn.done:
+			s.err = s.conn.getErr()
+		}
+		if s.err == nil {
+			s.err = ErrSessionClosed
+		}
+		// Signal goroutines waiting on the session.
+		close(s.done)
+	}()
 
 	var (
-		links       = make(map[uint32]*link)    // mapping of remote handles to links
-		linksByName = make(map[string]*link)    // maping of names to links
-		handles     = &bitmap{max: s.handleMax} // allocated handles
+		links      = make(map[uint32]*link)    // mapping of remote handles to links
+		linksByKey = make(map[linkKey]*link)   // mapping of name+role link
+		handles    = &bitmap{max: s.handleMax} // allocated handles
 
 		handlesByDeliveryID       = make(map[uint32]uint32) // mapping of deliveryIDs to handles
 		deliveryIDByHandle        = make(map[uint32]uint32) // mapping of handles to latest deliveryID
@@ -499,18 +532,17 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					return
 				}
 			}
-
-			// release session
-			select {
-			case s.conn.delSession <- s:
-				s.err = ErrSessionClosed
-			case <-s.conn.done:
-				s.err = s.conn.getErr()
-			}
 			return
 
 		// handle allocation request
 		case l := <-s.allocateHandle:
+			// Check if link name already exists, if so then an error should be returned
+			if linksByKey[l.key] != nil {
+				l.err = errorErrorf("link with name '%v' already exists", l.key.name)
+				l.rx <- nil
+				continue
+			}
+
 			next, ok := handles.next()
 			if !ok {
 				l.err = errorErrorf("reached session handle max (%d)", s.handleMax)
@@ -518,14 +550,15 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				continue
 			}
 
-			l.handle = next         // allocate handle to the link
-			linksByName[l.name] = l // add to mapping
-			l.rx <- nil             // send nil on channel to indicate allocation complete
+			l.handle = next       // allocate handle to the link
+			linksByKey[l.key] = l // add to mapping
+			l.rx <- nil           // send nil on channel to indicate allocation complete
 
 		// handle deallocation request
 		case l := <-s.deallocateHandle:
 			delete(links, l.remoteHandle)
 			delete(deliveryIDByHandle, l.handle)
+			delete(linksByKey, l.key)
 			handles.remove(l.handle)
 			close(l.rx) // close channel to indicate deallocation
 
@@ -635,11 +668,12 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				// On Attach response link should be looked up by name, then added
 				// to the links map with the remote's handle contained in this
 				// attach frame.
-				link, linkOk := linksByName[body.Name]
+				//
+				// Note body.Role is the remote peer's role, we reverse for the local key.
+				link, linkOk := linksByKey[linkKey{name: body.Name, role: !body.Role}]
 				if !linkOk {
 					break
 				}
-				delete(linksByName, body.Name) // name no longer needed
 
 				link.remoteHandle = body.Handle
 				links[link.remoteHandle] = link
@@ -722,9 +756,9 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				delete(handlesByDeliveryID, deliveryID)
 			}
 
-			// if confirmSettlement requested, add done chan to map
+			// if not settled, add done chan to map
 			// and clear from frame so conn doesn't close it.
-			if fr.confirmSettlement && fr.done != nil {
+			if !fr.Settled && fr.done != nil {
 				settlementByDeliveryID[deliveryID] = fr.done
 				fr.done = nil
 			}
@@ -781,15 +815,26 @@ func (e *DetachError) Error() string {
 // Default link options
 const (
 	DefaultLinkCredit      = 1
-	DefaultLinkBatching    = true
+	DefaultLinkBatching    = false
 	DefaultLinkBatchMaxAge = 5 * time.Second
 )
+
+// linkKey uniquely identifies a link on a connection by name and direction.
+//
+// A link can be identified uniquely by the ordered tuple
+//     (source-container-id, target-container-id, name)
+// On a single connection the container ID pairs can be abbreviated
+// to a boolean flag indicating the direction of the link.
+type linkKey struct {
+	name string
+	role role // Local role: sender/receiver
+}
 
 // link is a unidirectional route.
 //
 // May be used for sending or receiving.
 type link struct {
-	name          string               // our name
+	key           linkKey              // Name and direction
 	handle        uint32               // our handle
 	remoteHandle  uint32               // remote's handle
 	dynamicAddr   bool                 // request a dynamic link address from the server
@@ -866,7 +911,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	}
 
 	attach := &performAttach{
-		Name:               l.name,
+		Name:               l.key.name,
 		Handle:             l.handle,
 		ReceiverSettleMode: l.receiverSettleMode,
 		SenderSettleMode:   l.senderSettleMode,
@@ -907,6 +952,42 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		return nil, errorErrorf("unexpected attach response: %#v", fr)
 	}
 
+	// If the remote encounters an error during the attach it returns an Attach
+	// with no Source or Target. The remote then sends a Detach with an error.
+	//
+	//   Note that if the application chooses not to create a terminus, the session
+	//   endpoint will still create a link endpoint and issue an attach indicating
+	//   that the link endpoint has no associated local terminus. In this case, the
+	//   session endpoint MUST immediately detach the newly created link endpoint.
+	//
+	// http://docs.oasis-open.org/amqp/core/v1.0/csprd01/amqp-core-transport-v1.0-csprd01.html#doc-idp386144
+	if resp.Source == nil && resp.Target == nil {
+		// wait for detach
+		select {
+		case <-s.done:
+			return nil, s.err
+		case fr = <-l.rx:
+		}
+
+		detach, ok := fr.(*performDetach)
+		if !ok {
+			return nil, errorErrorf("unexpected frame while waiting for detach: %#v", fr)
+		}
+
+		// send return detach
+		fr = &performDetach{
+			Handle: l.handle,
+			Closed: true,
+		}
+		debug(1, "TX: %s", fr)
+		s.txFrame(fr, nil)
+
+		if detach.Error == nil {
+			return nil, errorErrorf("received detach with no error specified")
+		}
+		return nil, detach.Error
+	}
+
 	if l.maxMessageSize == 0 || resp.MaxMessageSize < l.maxMessageSize {
 		l.maxMessageSize = resp.MaxMessageSize
 	}
@@ -920,18 +1001,18 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		l.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
 		l.messages = make(chan Message, l.receiver.maxCredit)
-		if resp.SenderSettleMode != nil {
-			l.senderSettleMode = resp.SenderSettleMode
-		}
 	} else {
 		// if dynamic address requested, copy assigned name to address
 		if l.dynamicAddr && resp.Target != nil {
 			l.target.Address = resp.Target.Address
 		}
 		l.transfers = make(chan performTransfer)
-		if resp.ReceiverSettleMode != nil {
-			l.receiverSettleMode = resp.ReceiverSettleMode
-		}
+	}
+
+	err = l.setSettleModes(resp)
+	if err != nil {
+		l.muxDetach()
+		return nil, err
 	}
 
 	go l.mux()
@@ -939,9 +1020,35 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	return l, nil
 }
 
+// setSettleModes sets the settlement modes based on the resp performAttach.
+//
+// If a settlement mode has been explicitly set locally and it was not honored by the
+// server an error is returned.
+func (l *link) setSettleModes(resp *performAttach) error {
+	var (
+		localRecvSettle = l.receiverSettleMode.value()
+		respRecvSettle  = resp.ReceiverSettleMode.value()
+	)
+	if l.receiverSettleMode != nil && localRecvSettle != respRecvSettle {
+		return fmt.Errorf("amqp: receiver settlement mode %q requested, received %q from server", l.receiverSettleMode, &respRecvSettle)
+	}
+	l.receiverSettleMode = &respRecvSettle
+
+	var (
+		localSendSettle = l.senderSettleMode.value()
+		respSendSettle  = resp.SenderSettleMode.value()
+	)
+	if l.senderSettleMode != nil && localSendSettle != respSendSettle {
+		return fmt.Errorf("amqp: sender settlement mode %q requested, received %q from server", l.senderSettleMode, &respSendSettle)
+	}
+	l.senderSettleMode = &respSendSettle
+
+	return nil
+}
+
 func newLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	l := &link{
-		name:          randString(40),
+		key:           linkKey{randString(40), role(r != nil)},
 		session:       s,
 		receiver:      r,
 		close:         make(chan struct{}),
@@ -1076,16 +1183,90 @@ func (l *link) muxFlow() error {
 }
 
 func (l *link) muxReceive(fr performTransfer) error {
-	// record the delivery ID and message format if this is
-	// the first frame of the message
 	if !l.more {
+		// this is the first transfer of a message,
+		// record the delivery ID, message format,
+		// and delivery Tag
 		if fr.DeliveryID != nil {
 			l.msg.deliveryID = *fr.DeliveryID
 		}
-
 		if fr.MessageFormat != nil {
 			l.msg.Format = *fr.MessageFormat
 		}
+		l.msg.DeliveryTag = fr.DeliveryTag
+
+		// these fields are required on first transfer of a message
+		if fr.DeliveryID == nil {
+			msg := "received message without a delivery-id"
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+		if fr.MessageFormat == nil {
+			msg := "received message without a message-format"
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+		if fr.DeliveryTag == nil {
+			msg := "received message without a delivery-tag"
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+	} else {
+		// this is a continuation of a multipart message
+		// some fields may be omitted on continuation transfers,
+		// but if they are included they must be consistent
+		// with the first.
+
+		if fr.DeliveryID != nil && *fr.DeliveryID != l.msg.deliveryID {
+			msg := fmt.Sprintf(
+				"received continuation transfer with inconsistent delivery-id: %d != %d",
+				*fr.DeliveryID, l.msg.deliveryID,
+			)
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+		if fr.MessageFormat != nil && *fr.MessageFormat != l.msg.Format {
+			msg := fmt.Sprintf(
+				"received continuation transfer with inconsistent message-format: %d != %d",
+				*fr.MessageFormat, l.msg.Format,
+			)
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+		if fr.DeliveryTag != nil && !bytes.Equal(fr.DeliveryTag, l.msg.DeliveryTag) {
+			msg := fmt.Sprintf(
+				"received continuation transfer with inconsistent delivery-tag: %q != %q",
+				fr.DeliveryTag, l.msg.DeliveryTag,
+			)
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: msg,
+			})
+			return errorNew(msg)
+		}
+	}
+
+	// discard message if it's been aborted
+	if fr.Aborted {
+		l.buf.reset()
+		l.msg = Message{}
+		l.more = false
+		return nil
 	}
 
 	// ensure maxMessageSize will not be exceeded
@@ -1399,6 +1580,36 @@ func linkProperty(key string, value interface{}) LinkOption {
 	}
 }
 
+// LinkName sets the name of the link.
+//
+// The link names must be unique per-connection and direction.
+//
+// Default: randomly generated.
+func LinkName(name string) LinkOption {
+	return func(l *link) error {
+		l.key.name = name
+		return nil
+	}
+}
+
+// LinkSourceCapabilities sets the source capabilities.
+func LinkSourceCapabilities(capabilities ...string) LinkOption {
+	return func(l *link) error {
+		if l.source == nil {
+			l.source = new(source)
+		}
+
+		// Convert string to symbol
+		symbolCapabilities := make([]symbol, len(capabilities))
+		for i, v := range capabilities {
+			symbolCapabilities[i] = symbol(v)
+		}
+
+		l.source.Capabilities = append(l.source.Capabilities, symbolCapabilities...)
+		return nil
+	}
+}
+
 // LinkSourceAddress sets the source address.
 func LinkSourceAddress(addr string) LinkOption {
 	return func(l *link) error {
@@ -1463,12 +1674,12 @@ func LinkBatchMaxAge(d time.Duration) LinkOption {
 	}
 }
 
-// LinkSenderSettle sets the sender settlement mode.
+// LinkSenderSettle sets the requested sender settlement mode.
 //
-// When the Link is the Receiver, this is a request to the remote
-// server.
+// If a settlement mode is explicitly set and the server does not
+// honor it an error will be returned during link attachment.
 //
-// When the Link is the Sender, this is the actual settlement mode.
+// Default: Accept the settlement mode set by the server, commonly ModeMixed.
 func LinkSenderSettle(mode SenderSettleMode) LinkOption {
 	return func(l *link) error {
 		if mode > ModeMixed {
@@ -1479,12 +1690,12 @@ func LinkSenderSettle(mode SenderSettleMode) LinkOption {
 	}
 }
 
-// LinkReceiverSettle sets the receiver settlement mode.
+// LinkReceiverSettle sets the requested receiver settlement mode.
 //
-// When the Link is the Sender, this is a request to the remote
-// server.
+// If a settlement mode is explicitly set and the server does not
+// honor it an error will be returned during link attachment.
 //
-// When the Link is the Receiver, this is the actual settlement mode.
+// Default: Accept the settlement mode set by the server, commonly ModeFirst.
 func LinkReceiverSettle(mode ReceiverSettleMode) LinkOption {
 	return func(l *link) error {
 		if mode > ModeSecond {
@@ -1495,22 +1706,37 @@ func LinkReceiverSettle(mode ReceiverSettleMode) LinkOption {
 	}
 }
 
-// LinkSessionFilter sets a session filter (com.microsoft:session-filter) on the link source.
-// This is used in Azure Service Bus to filter messages by session ID on a receiving link.
-func LinkSessionFilter(sessionID string) LinkOption {
-	// <descriptor name="com.microsoft:session-filter" code="00000013:7000000C"/>
-	return linkSourceFilter("com.microsoft:session-filter", uint64(0x00000137000000C), sessionID)
-}
-
 // LinkSelectorFilter sets a selector filter (apache.org:selector-filter:string) on the link source.
 func LinkSelectorFilter(filter string) LinkOption {
 	// <descriptor name="apache.org:selector-filter:string" code="0x0000468C:0x00000004"/>
-	return linkSourceFilter("apache.org:selector-filter:string", uint64(0x0000468C00000004), filter)
+	return LinkSourceFilter("apache.org:selector-filter:string", 0x0000468C00000004, filter)
 }
 
-// linkSourceFilter sets a filter on the link source.
-func linkSourceFilter(name string, code uint64, value string) LinkOption {
-	nameSym := symbol(name)
+// LinkSourceFilter is an advanced API for setting non-standard source filters.
+// Please file an issue or open a PR if a standard filter is missing from this
+// library.
+//
+// The name is the key for the filter map. It will be encoded as an AMQP symbol type.
+//
+// The code is the descriptor of the described type value. The domain-id and descriptor-id
+// should be concatenated together. If 0 is passed as the code, the name will be used as
+// the descriptor.
+//
+// The value is the value of the descriped types. Acceptable types for value are specific
+// to the filter.
+//
+// Example:
+//
+// The standard selector-filter is defined as:
+//  <descriptor name="apache.org:selector-filter:string" code="0x0000468C:0x00000004"/>
+// In this case the name is "apache.org:selector-filter:string" and the code is
+// 0x0000468C00000004.
+//  LinkSourceFilter("apache.org:selector-filter:string", 0x0000468C00000004, exampleValue)
+//
+// References:
+//  http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-messaging-v1.0-os.html#type-filter-set
+//  http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-types-v1.0-os.html#section-descriptor-values
+func LinkSourceFilter(name string, code uint64, value interface{}) LinkOption {
 	return func(l *link) error {
 		if l.source == nil {
 			l.source = new(source)
@@ -1518,8 +1744,16 @@ func linkSourceFilter(name string, code uint64, value string) LinkOption {
 		if l.source.Filter == nil {
 			l.source.Filter = make(map[symbol]*describedType)
 		}
-		l.source.Filter[nameSym] = &describedType{
-			descriptor: code,
+
+		var descriptor interface{}
+		if code != 0 {
+			descriptor = code
+		} else {
+			descriptor = symbol(name)
+		}
+
+		l.source.Filter[symbol(name)] = &describedType{
+			descriptor: descriptor,
 			value:      value,
 		}
 		return nil
@@ -1535,6 +1769,80 @@ func linkSourceFilter(name string, code uint64, value string) LinkOption {
 func LinkMaxMessageSize(size uint64) LinkOption {
 	return func(l *link) error {
 		l.maxMessageSize = size
+		return nil
+	}
+}
+
+// LinkTargetDurability sets the target durability policy.
+//
+// Default: DurabilityNone.
+func LinkTargetDurability(d Durability) LinkOption {
+	return func(l *link) error {
+		if d > DurabilityUnsettledState {
+			return errorErrorf("invalid Durability %d", d)
+		}
+
+		if l.target == nil {
+			l.target = new(target)
+		}
+		l.target.Durable = d
+
+		return nil
+	}
+}
+
+// LinkTargetExpiryPolicy sets the link expiration policy.
+//
+// Default: ExpirySessionEnd.
+func LinkTargetExpiryPolicy(p ExpiryPolicy) LinkOption {
+	return func(l *link) error {
+		err := p.validate()
+		if err != nil {
+			return err
+		}
+
+		if l.target == nil {
+			l.target = new(target)
+		}
+		l.target.ExpiryPolicy = p
+
+		return nil
+	}
+}
+
+// LinkSourceDurability sets the source durability policy.
+//
+// Default: DurabilityNone.
+func LinkSourceDurability(d Durability) LinkOption {
+	return func(l *link) error {
+		if d > DurabilityUnsettledState {
+			return errorErrorf("invalid Durability %d", d)
+		}
+
+		if l.source == nil {
+			l.source = new(source)
+		}
+		l.source.Durable = d
+
+		return nil
+	}
+}
+
+// LinkSourceExpiryPolicy sets the link expiration policy.
+//
+// Default: ExpirySessionEnd.
+func LinkSourceExpiryPolicy(p ExpiryPolicy) LinkOption {
+	return func(l *link) error {
+		err := p.validate()
+		if err != nil {
+			return err
+		}
+
+		if l.source == nil {
+			l.source = new(source)
+		}
+		l.source.ExpiryPolicy = p
+
 		return nil
 	}
 }

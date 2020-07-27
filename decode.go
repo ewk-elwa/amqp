@@ -119,6 +119,10 @@ func parseFrameBody(r *buffer) (frameBody, error) {
 		t := new(saslMechanisms)
 		err := t.unmarshal(r)
 		return t, err
+	case typeCodeSASLChallenge:
+		t := new(saslChallenge)
+		err := t.unmarshal(r)
+		return t, err
 	case typeCodeSASLOutcome:
 		t := new(saslOutcome)
 		err := t.unmarshal(r)
@@ -571,6 +575,12 @@ func readBinary(r *buffer) ([]byte, error) {
 		return nil, errorErrorf("type code %#02x is not a recognized binary type", type_)
 	}
 
+	if length == 0 {
+		// An empty value and a nil value are distinct,
+		// ensure that the returned value is not nil in this case.
+		return make([]byte, 0), nil
+	}
+
 	buf, ok := r.next(length)
 	if !ok {
 		return nil, errorNew("invalid length")
@@ -940,8 +950,8 @@ func readTimestamp(r *buffer) (time.Time, error) {
 	}
 
 	n, err := r.readUint64()
-	rem := n % 1000
-	return time.Unix(int64(n)/1000, int64(rem)*1000000).UTC(), err
+	ms := int64(n)
+	return time.Unix(ms/1000, (ms%1000)*1000000).UTC(), err
 }
 
 func readInt(r *buffer) (int, error) {
