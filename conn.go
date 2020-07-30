@@ -684,11 +684,11 @@ func (c *conn) writeFrames(frs []frame) error {
 	}
 
 	// TODO(eking) if framesize per frame, or for all frames
-	// validate the frame isn't exceeding peer's max frame size
-	requiredFrameSize := c.txBuf.len()
-	if uint64(requiredFrameSize) > uint64(c.peerMaxFrameSize) {
-		return errorErrorf("%T frame size %d larger than peer's max frame size", fr, requiredFrameSize, c.peerMaxFrameSize)
-	}
+	//// validate the frame isn't exceeding peer's max frame size
+	//requiredFrameSize := c.txBuf.len()
+	//if uint64(requiredFrameSize) > uint64(c.peerMaxFrameSize) {
+	//	return errorErrorf("%T frame size %d larger than peer's max frame size", fr, requiredFrameSize, c.peerMaxFrameSize)
+	//}
 
 	// write to network
 	_, err := c.net.Write(c.txBuf.bytes())
