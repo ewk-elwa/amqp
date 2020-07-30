@@ -188,7 +188,7 @@ func (c *Client) NewSessionBegin(sessionOpts []SessionOption) (*Session, error) 
 	}
 
 	debug(1, "TX: %s", begin)
-	s.txFrame(begin, nil)
+	s.addBatchTxFrames(begin, nil)
 	return s, nil
 }
 
@@ -209,6 +209,8 @@ func (c *Client) NewSessionWithSenderReceiverOpts(sessionOpts []SessionOption, s
 	if err != nil {
 		return nil, nil, nil, errorErrorf("could not create NewReceiverAttach: %v", err)
 	}
+
+	session.writeBatchTxFrame()
 
 	// wait for session Begin and Link attached
 	var fr frame
@@ -318,6 +320,9 @@ type Session struct {
 	closeOnce sync.Once
 	done      chan struct{}
 	err       error
+
+	// used for batch tx Frames
+	batchTxFrames []frame
 }
 
 func newSession(c *conn, channel uint16) *Session {
@@ -362,6 +367,21 @@ func (s *Session) txFrame(p frameBody, done chan deliveryState) error {
 		body:    p,
 		done:    done,
 	})
+}
+
+// addBatchTxFrames add frames to session batchTxFrames for sending later
+func (s *Session) addBatchTxFrames(p frameBody, done chan deliveryState) {
+	s.batchTxFrames = append(s.batchTxFrames, frame{
+		type_:   frameTypeAMQP,
+		channel: s.channel,
+		body:    p,
+		done:    done,
+	})
+}
+
+// writeBatchTxFrame sends a batch of frame to the connWriter
+func (s *Session) writeBatchTxFrame() error {
+	return s.conn.wantWriteFrames(s.batchTxFrames)
 }
 
 // lockedRand provides a rand source that is safe for concurrent use.
@@ -1200,7 +1220,7 @@ func sendAttachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 	// send Attach frame
 	debug(1, "TX: %s", attach)
-	s.txFrame(attach, nil)
+	s.addBatchTxFrames(attach, nil)
 
 	return l, nil
 }
