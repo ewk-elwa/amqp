@@ -201,9 +201,11 @@ type conn struct {
 	connReaderRun chan func() // functions to be run by conn reader (set deadline on conn to run)
 
 	// connWriter
-	txFrame chan frame // AMQP frames to be sent by connWriter
-	txBuf   buffer     // buffer for marshaling frames before transmitting
-	txDone  chan struct{}
+	txFrame  chan frame   // AMQP frames to be sent by connWriter
+	txFrames chan []frame // AMQP frames to be sent by connWriter
+
+	txBuf  buffer // buffer for marshaling frames before transmitting
+	txDone chan struct{}
 }
 
 type newSessionResp struct {
@@ -604,6 +606,17 @@ func (c *conn) connWriter() {
 				close(fr.done)
 			}
 
+		// frame write request
+		case frs := <-c.txFrames:
+			err = c.writeFrames(frs)
+			if err == nil {
+				for _, fr := range frs {
+					if fr.done != nil {
+						close(fr.done)
+					}
+				}
+			}
+
 		// keepalive timer
 		case <-keepalive:
 			_, err = c.net.Write(keepaliveFrame)
@@ -654,6 +667,34 @@ func (c *conn) writeFrame(fr frame) error {
 	return err
 }
 
+// writeFrame writes a frame to the network, may only be used
+// by connWriter after initial negotiation.
+func (c *conn) writeFrames(frs []frame) error {
+	if c.connectTimeout != 0 {
+		_ = c.net.SetWriteDeadline(time.Now().Add(c.connectTimeout))
+	}
+
+	// writeFrame into txBuf
+	c.txBuf.reset()
+	for _, fr := range frs {
+		err := writeFrame(&c.txBuf, fr)
+		if err != nil {
+			return err
+		}
+	}
+
+	// TODO(eking) if framesize per frame, or for all frames
+	// validate the frame isn't exceeding peer's max frame size
+	requiredFrameSize := c.txBuf.len()
+	if uint64(requiredFrameSize) > uint64(c.peerMaxFrameSize) {
+		return errorErrorf("%T frame size %d larger than peer's max frame size", fr, requiredFrameSize, c.peerMaxFrameSize)
+	}
+
+	// write to network
+	_, err := c.net.Write(c.txBuf.bytes())
+	return err
+}
+
 // writeProtoHeader writes an AMQP protocol header to the
 // network
 func (c *conn) writeProtoHeader(pID protoID) error {
@@ -672,6 +713,17 @@ var keepaliveFrame = []byte{0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00}
 func (c *conn) wantWriteFrame(fr frame) error {
 	select {
 	case c.txFrame <- fr:
+		return nil
+	case <-c.done:
+		return c.getErr()
+	}
+}
+
+// wantWriteFrame is used by sessions and links to send frame to
+// connWriter.
+func (c *conn) wantWriteFrames(frs []frame) error {
+	select {
+	case c.txFrames <- frs:
 		return nil
 	case <-c.done:
 		return c.getErr()
