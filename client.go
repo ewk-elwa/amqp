@@ -232,6 +232,22 @@ func (c *Client) NewSessionWithSenderReceiverOpts(sessionOpts []SessionOption, s
 	// start Session multiplexor
 	go session.mux(begin)
 
+	// Wait for attach for sender and receiver
+	err = waitForAttach(session, senderLink.link, false)
+	if err != nil {
+		senderLink.Close(context.Background())
+		receiverLink.Close(context.Background())
+		_ = session.Close(context.Background()) // deallocate session on error
+		return nil, nil, nil, errorErrorf("failed waiting for attach on sender: %+v", err)
+	}
+	err = waitForAttach(session, receiverLink.link, true)
+	if err != nil {
+		senderLink.Close(context.Background())
+		receiverLink.Close(context.Background())
+		_ = session.Close(context.Background()) // deallocate session on error
+		return nil, nil, nil, errorErrorf("failed waiting for attach on receiver: %+v", err)
+	}
+
 	return session, senderLink, receiverLink, nil
 }
 
@@ -1224,6 +1240,80 @@ func sendAttachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 	return l, nil
 }
+
+func waitForAttach(s *Session, l *link, isReceiver bool) (error) {
+	// wait for response
+	var fr frameBody
+	select {
+	case <-s.done:
+		return s.err
+	case fr = <-l.rx:
+	}
+	debug(3, "RX: %s", fr)
+	resp, ok := fr.(*performAttach)
+	if !ok {
+		return errorErrorf("unexpected attach response: %#v", fr)
+	}
+
+	if resp.Source == nil && resp.Target == nil {
+		// wait for detach
+		select {
+		case <-s.done:
+			return s.err
+		case fr = <-l.rx:
+		}
+
+		detach, ok := fr.(*performDetach)
+		if !ok {
+			return errorErrorf("unexpected frame while waiting for detach: %#v", fr)
+		}
+
+		// send return detach
+		fr = &performDetach{
+			Handle: l.handle,
+			Closed: true,
+		}
+		debug(1, "TX: %s", fr)
+		s.txFrame(fr, nil)
+
+		if detach.Error == nil {
+			return errorErrorf("received detach with no error specified")
+		}
+		return detach.Error
+	}
+
+	if l.maxMessageSize == 0 || resp.MaxMessageSize < l.maxMessageSize {
+		l.maxMessageSize = resp.MaxMessageSize
+	}
+
+	if isReceiver {
+		// if dynamic address requested, copy assigned name to address
+		if l.dynamicAddr && resp.Source != nil {
+			l.source.Address = resp.Source.Address
+		}
+		// deliveryCount is a sequence number, must initialize to sender's initial sequence number
+		l.deliveryCount = resp.InitialDeliveryCount
+		// buffer receiver so that link.mux doesn't block
+		l.messages = make(chan Message, l.receiver.maxCredit)
+	} else {
+		// if dynamic address requested, copy assigned name to address
+		if l.dynamicAddr && resp.Target != nil {
+			l.target.Address = resp.Target.Address
+		}
+		l.transfers = make(chan performTransfer)
+	}
+
+	err := l.setSettleModes(resp)
+	if err != nil {
+		l.muxDetach()
+		return err
+	}
+
+	go l.mux()
+
+	return nil
+}
+
 
 // setSettleModes sets the settlement modes based on the resp performAttach.
 //
