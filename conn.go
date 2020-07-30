@@ -232,6 +232,7 @@ func newConn(netConn net.Conn, opts ...ConnOption) (*conn, error) {
 		newSession:       make(chan newSessionResp),
 		delSession:       make(chan *Session),
 		txFrame:          make(chan frame),
+		txFrames:         make(chan []frame),
 		txDone:           make(chan struct{}),
 	}
 
