@@ -1172,7 +1172,6 @@ func sendAttachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	next, _ := s.handles.next()
 	l.handle = next         // allocate handle to the link
 	s.linksByKey[l.key] = l // add to mapping
-	l.rx <- nil             // send nil on channel to indicate allocation complete
 
 	attach := &performAttach{
 		Name:               l.key.name,
