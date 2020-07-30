@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -670,17 +671,20 @@ func (c *conn) writeFrame(fr frame) error {
 // writeFrame writes a frame to the network, may only be used
 // by connWriter after initial negotiation.
 func (c *conn) writeFrames(frs []frame) error {
+	fmt.Println("...writeFrames()")
 	if c.connectTimeout != 0 {
 		_ = c.net.SetWriteDeadline(time.Now().Add(c.connectTimeout))
 	}
 
 	// writeFrame into txBuf
-	c.txBuf.reset()
+	var txBufs []byte
 	for _, fr := range frs {
+		c.txBuf.reset()
 		err := writeFrame(&c.txBuf, fr)
 		if err != nil {
 			return err
 		}
+		txBufs = append(txBufs, c.txBuf.bytes()...)
 	}
 
 	// TODO(eking) if framesize per frame, or for all frames
@@ -691,7 +695,8 @@ func (c *conn) writeFrames(frs []frame) error {
 	//}
 
 	// write to network
-	_, err := c.net.Write(c.txBuf.bytes())
+	fmt.Printf("...writeFrames() writing %d bytes\n", len(txBufs))
+	_, err := c.net.Write(txBufs)
 	return err
 }
 
