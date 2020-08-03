@@ -1,4 +1,4 @@
-PACKAGE := pack.ag/amqp
+PACKAGE := ewk-elwa/amqp
 FUZZ_DIR := ./fuzz
 
 all: test
