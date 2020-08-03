@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"pack.ag/amqp"
+	"ewk-elwa/amqp"
 )
 
 func Example() {
