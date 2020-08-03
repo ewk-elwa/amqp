@@ -339,6 +339,8 @@ type Session struct {
 
 	// used for batch tx Frames
 	batchTxFrames []frame
+	
+	isInit bool
 }
 
 func newSession(c *conn, channel uint16) *Session {
@@ -643,6 +645,7 @@ func (s *Session) init() {
 	s.handlesByRemoteDeliveryID = make(map[uint32]uint32) // mapping of remote deliveryID to handles
 
 	s.settlementByDeliveryID = make(map[uint32]chan deliveryState)
+	s.isInit = true
 }
 
 func (s *Session) mux(remoteBegin *performBegin) {
@@ -668,6 +671,10 @@ func (s *Session) mux(remoteBegin *performBegin) {
 		remoteOutgoingWindow = remoteBegin.OutgoingWindow
 	)
 
+  if !s.isInit {
+		s.init()
+	}
+	
 	for {
 		txTransfer := s.txTransfer
 		// disable txTransfer if flow control windows have been exceeded
