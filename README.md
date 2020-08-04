@@ -1,12 +1,12 @@
-# **github/ewk-elwa/amqp**
+# **github.com/ewk-elwa/amqp**
 
-[![Go Report Card](https://goreportcard.com/badge/github/ewk-elwa/amqp)](https://goreportcard.com/report/github/ewk-elwa/amqp)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ewk-elwa/amqp)](https://goreportcard.com/report/github.com/ewk-elwa/amqp)
 [![Coverage Status](https://coveralls.io/repos/github/vcabbage/amqp/badge.svg?branch=master)](https://coveralls.io/github/vcabbage/amqp?branch=master)
 [![Build Status](https://github.com/vcabbage/amqp/workflows/tests/badge.svg)](https://github.com/vcabbage/amqp/actions)
-[![GoDoc](https://godoc.org/github/ewk-elwa/amqp?status.svg)](http://godoc.org/github/ewk-elwa/amqp)
+[![GoDoc](https://godoc.org/github.com/ewk-elwa/amqp?status.svg)](http://godoc.org/github.com/ewk-elwa/amqp)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/vcabbage/amqp/master/LICENSE)
 
-github/ewk-elwa/amqp is an AMQP 1.0 client implementation for Go.
+github.com/ewk-elwa/amqp is an AMQP 1.0 client implementation for Go.
 
 **NOTE: This project is no longer under active development. See [issue #205](https://github.com/vcabbage/amqp/issues/205) for details.**
 
@@ -19,7 +19,7 @@ This library aims to be stable and worthy of production usage, but the API is st
 ## Install
 
 ```
-go get -u github/ewk-elwa/amqp
+go get -u github.com/ewk-elwa/amqp
 ```
 
 ## Contributing
@@ -37,7 +37,7 @@ import (
 	"log"
 	"time"
 
-	"github/ewk-elwa/amqp"
+	"github.com/ewk-elwa/amqp"
 )
 
 func main() {
