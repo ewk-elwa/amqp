@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"ewk-elwa/amqp"
+	"github/ewk-elwa/amqp"
 )
 
 // Tests that require a local broker running on the standard AMQP port.

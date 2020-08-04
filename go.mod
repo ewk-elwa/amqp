@@ -1,4 +1,4 @@
-module ewk-elwa/amqp
+module github/ewk-elwa/amqp
 
 go 1.14
 

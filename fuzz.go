@@ -6,7 +6,7 @@ import (
 	"context"
 	"time"
 
-	"ewk-elwa/amqp/internal/testconn"
+	"github/ewk-elwa/amqp/internal/testconn"
 )
 
 func FuzzConn(data []byte) int {

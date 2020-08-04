@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"ewk-elwa/amqp"
+	"github/ewk-elwa/amqp"
 )
 
 func Example() {

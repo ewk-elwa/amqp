@@ -1,4 +1,4 @@
-PACKAGE := ewk-elwa/amqp
+PACKAGE := github/ewk-elwa/amqp
 FUZZ_DIR := ./fuzz
 
 all: test

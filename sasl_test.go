@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"ewk-elwa/amqp/internal/testconn"
+	"github/ewk-elwa/amqp/internal/testconn"
 	"strings"
 	"testing"
 	"time"
