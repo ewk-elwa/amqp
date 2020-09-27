@@ -157,6 +157,100 @@ func (c *Client) NewSession(opts ...SessionOption) (*Session, error) {
 	return s, nil
 }
 
+func (c *Client) NewSessionBegin(sessionOpts []SessionOption) (*Session, error) {
+	// get a session allocated by Client.mux
+	var sResp newSessionResp
+	select {
+	case <-c.conn.done:
+		return nil, c.conn.getErr()
+	case sResp = <-c.conn.newSession:
+	}
+
+	if sResp.err != nil {
+		return nil, sResp.err
+	}
+	s := sResp.session
+
+	for _, opt := range sessionOpts {
+		err := opt(s)
+		if err != nil {
+			_ = s.Close(context.Background()) // deallocate session on error
+			return nil, err
+		}
+	}
+
+	// send Begin to server
+	begin := &performBegin{
+		NextOutgoingID: 0,
+		IncomingWindow: s.incomingWindow,
+		OutgoingWindow: s.outgoingWindow,
+		HandleMax:      s.handleMax,
+	}
+
+	debug(1, "TX: %s", begin)
+	s.addBatchTxFrames(begin, nil)
+	return s, nil
+}
+
+// NewSession opens a new AMQP session to the server.
+func (c *Client) NewSessionWithSenderReceiverOpts(sessionOpts []SessionOption, senderOpts []LinkOption, receiverOpts []LinkOption) (*Session, *Sender, *Receiver, error) {
+
+	session, err := c.NewSessionBegin(sessionOpts)
+	if err != nil {
+		return nil, nil, nil, errorErrorf("could not create NewSessionBegin: %v", err)
+	}
+	session.init()
+
+	senderLink, err := session.NewSenderAttach(senderOpts...)
+	if err != nil {
+		return nil, nil, nil, errorErrorf("could not create NewSenderAttach: %v", err)
+	}
+	receiverLink, err := session.NewReceiverAttach(receiverOpts...)
+	if err != nil {
+		return nil, nil, nil, errorErrorf("could not create NewReceiverAttach: %v", err)
+	}
+
+	session.writeBatchTxFrame()
+
+	// wait for session Begin and Link attached
+	var fr frame
+	select {
+	case <-c.conn.done:
+		return nil, nil, nil, c.conn.getErr()
+	case fr = <-session.rx:
+	}
+	debug(1, "RX: %s", fr.body)
+
+	begin, ok := fr.body.(*performBegin)
+	if !ok {
+		senderLink.Close(context.Background())
+		receiverLink.Close(context.Background())
+		_ = session.Close(context.Background()) // deallocate session on error
+		return nil, nil, nil, errorErrorf("unexpected begin response: %+v", fr.body)
+	}
+
+	// start Session multiplexor
+	go session.mux(begin)
+
+	// Wait for attach for sender and receiver
+	err = waitForAttach(session, senderLink.link, false)
+	if err != nil {
+		senderLink.Close(context.Background())
+		receiverLink.Close(context.Background())
+		_ = session.Close(context.Background()) // deallocate session on error
+		return nil, nil, nil, errorErrorf("failed waiting for attach on sender: %+v", err)
+	}
+	err = waitForAttach(session, receiverLink.link, true)
+	if err != nil {
+		senderLink.Close(context.Background())
+		receiverLink.Close(context.Background())
+		_ = session.Close(context.Background()) // deallocate session on error
+		return nil, nil, nil, errorErrorf("failed waiting for attach on receiver: %+v", err)
+	}
+
+	return session, senderLink, receiverLink, nil
+}
+
 // Default session options
 const (
 	DefaultMaxLinks = 4294967296
@@ -214,7 +308,20 @@ type Session struct {
 	tx            chan frameBody        // non-transfer frames to be sent; session must track disposition
 	txTransfer    chan *performTransfer // transfer frames to be sent; session must track disposition
 
-	// flow control
+	// Links
+	links      map[uint32]*link  // mapping of remote handles to links
+	linksByKey map[linkKey]*link // mapping of name+role link
+	handles    *bitmap           // allocated handles
+
+	handlesByDeliveryID       map[uint32]uint32 // mapping of deliveryIDs to handles
+	deliveryIDByHandle        map[uint32]uint32 // mapping of handles to latest deliveryID
+	handlesByRemoteDeliveryID map[uint32]uint32 // mapping of remote deliveryID to handles
+
+	settlementByDeliveryID map[uint32]chan deliveryState
+
+	// flow control values
+	nextOutgoingID uint32
+	nextIncomingID uint32
 	incomingWindow uint32
 	outgoingWindow uint32
 
@@ -229,6 +336,11 @@ type Session struct {
 	closeOnce sync.Once
 	done      chan struct{}
 	err       error
+
+	// used for batch tx Frames
+	batchTxFrames []frame
+	
+	isInit bool
 }
 
 func newSession(c *conn, channel uint16) *Session {
@@ -275,6 +387,21 @@ func (s *Session) txFrame(p frameBody, done chan deliveryState) error {
 	})
 }
 
+// addBatchTxFrames add frames to session batchTxFrames for sending later
+func (s *Session) addBatchTxFrames(p frameBody, done chan deliveryState) {
+	s.batchTxFrames = append(s.batchTxFrames, frame{
+		type_:   frameTypeAMQP,
+		channel: s.channel,
+		body:    p,
+		done:    done,
+	})
+}
+
+// writeBatchTxFrame sends a batch of frame to the connWriter
+func (s *Session) writeBatchTxFrame() error {
+	return s.conn.wantWriteFrames(s.batchTxFrames)
+}
+
 // lockedRand provides a rand source that is safe for concurrent use.
 type lockedRand struct {
 	mu  sync.Mutex
@@ -309,6 +436,36 @@ func (s *Session) NewReceiver(opts ...LinkOption) (*Receiver, error) {
 	}
 
 	l, err := attachLink(s, r, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	r.link = l
+
+	// batching is just extra overhead when maxCredits == 1
+	if r.maxCredit == 1 {
+		r.batching = false
+	}
+
+	// create dispositions channel and start dispositionBatcher if batching enabled
+	if r.batching {
+		// buffer dispositions chan to prevent disposition sends from blocking
+		r.dispositions = make(chan messageDisposition, r.maxCredit)
+		go r.dispositionBatcher()
+	}
+
+	return r, nil
+}
+
+// NewReceiver opens a new receiver link on the session.
+func (s *Session) NewReceiverAttach(opts ...LinkOption) (*Receiver, error) {
+	r := &Receiver{
+		batching:    DefaultLinkBatching,
+		batchMaxAge: DefaultLinkBatchMaxAge,
+		maxCredit:   DefaultLinkCredit,
+	}
+
+	l, err := sendAttachLink(s, r, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -468,6 +625,29 @@ func (s *Session) NewSender(opts ...LinkOption) (*Sender, error) {
 	return &Sender{link: l}, nil
 }
 
+// NewSenderAttach opens a new sender link on the session.
+func (s *Session) NewSenderAttach(opts ...LinkOption) (*Sender, error) {
+	l, err := sendAttachLink(s, nil, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Sender{link: l}, nil
+}
+
+func (s *Session) init() {
+	s.links = make(map[uint32]*link)       // mapping of remote handles to links
+	s.linksByKey = make(map[linkKey]*link) // mapping of name+role link
+	s.handles = &bitmap{max: s.handleMax}  // allocated handles
+
+	s.handlesByDeliveryID = make(map[uint32]uint32)       // mapping of deliveryIDs to handles
+	s.deliveryIDByHandle = make(map[uint32]uint32)        // mapping of handles to latest deliveryID
+	s.handlesByRemoteDeliveryID = make(map[uint32]uint32) // mapping of remote deliveryID to handles
+
+	s.settlementByDeliveryID = make(map[uint32]chan deliveryState)
+	s.isInit = true
+}
+
 func (s *Session) mux(remoteBegin *performBegin) {
 	defer func() {
 		// clean up session record in conn.mux()
@@ -484,16 +664,6 @@ func (s *Session) mux(remoteBegin *performBegin) {
 	}()
 
 	var (
-		links      = make(map[uint32]*link)    // mapping of remote handles to links
-		linksByKey = make(map[linkKey]*link)   // mapping of name+role link
-		handles    = &bitmap{max: s.handleMax} // allocated handles
-
-		handlesByDeliveryID       = make(map[uint32]uint32) // mapping of deliveryIDs to handles
-		deliveryIDByHandle        = make(map[uint32]uint32) // mapping of handles to latest deliveryID
-		handlesByRemoteDeliveryID = make(map[uint32]uint32) // mapping of remote deliveryID to handles
-
-		settlementByDeliveryID = make(map[uint32]chan deliveryState)
-
 		// flow control values
 		nextOutgoingID       uint32
 		nextIncomingID       = remoteBegin.NextOutgoingID
@@ -501,6 +671,10 @@ func (s *Session) mux(remoteBegin *performBegin) {
 		remoteOutgoingWindow = remoteBegin.OutgoingWindow
 	)
 
+  if !s.isInit {
+		s.init()
+	}
+	
 	for {
 		txTransfer := s.txTransfer
 		// disable txTransfer if flow control windows have been exceeded
@@ -537,29 +711,29 @@ func (s *Session) mux(remoteBegin *performBegin) {
 		// handle allocation request
 		case l := <-s.allocateHandle:
 			// Check if link name already exists, if so then an error should be returned
-			if linksByKey[l.key] != nil {
+			if s.linksByKey[l.key] != nil {
 				l.err = errorErrorf("link with name '%v' already exists", l.key.name)
 				l.rx <- nil
 				continue
 			}
 
-			next, ok := handles.next()
+			next, ok := s.handles.next()
 			if !ok {
 				l.err = errorErrorf("reached session handle max (%d)", s.handleMax)
 				l.rx <- nil
 				continue
 			}
 
-			l.handle = next       // allocate handle to the link
-			linksByKey[l.key] = l // add to mapping
-			l.rx <- nil           // send nil on channel to indicate allocation complete
+			l.handle = next         // allocate handle to the link
+			s.linksByKey[l.key] = l // add to mapping
+			l.rx <- nil             // send nil on channel to indicate allocation complete
 
 		// handle deallocation request
 		case l := <-s.deallocateHandle:
-			delete(links, l.remoteHandle)
-			delete(deliveryIDByHandle, l.handle)
-			delete(linksByKey, l.key)
-			handles.remove(l.handle)
+			delete(s.links, l.remoteHandle)
+			delete(s.deliveryIDByHandle, l.handle)
+			delete(s.linksByKey, l.key)
+			s.handles.remove(l.handle)
 			close(l.rx) // close channel to indicate deallocation
 
 		// incoming frame for link
@@ -576,9 +750,9 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					end = *body.Last
 				}
 				for deliveryID := start; deliveryID <= end; deliveryID++ {
-					handles := handlesByDeliveryID
+					handles := s.handlesByDeliveryID
 					if body.Role == roleSender {
-						handles = handlesByRemoteDeliveryID
+						handles = s.handlesByRemoteDeliveryID
 					}
 
 					handle, ok := handles[deliveryID]
@@ -590,8 +764,8 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					if body.Settled && body.Role == roleReceiver {
 						// check if settlement confirmation was requested, if so
 						// confirm by closing channel
-						if done, ok := settlementByDeliveryID[deliveryID]; ok {
-							delete(settlementByDeliveryID, deliveryID)
+						if done, ok := s.settlementByDeliveryID[deliveryID]; ok {
+							delete(s.settlementByDeliveryID, deliveryID)
 							select {
 							case done <- body.State:
 							default:
@@ -600,7 +774,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 						}
 					}
 
-					link, ok := links[handle]
+					link, ok := s.links[handle]
 					if !ok {
 						continue
 					}
@@ -643,7 +817,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 				// Send to link if handle is set
 				if body.Handle != nil {
-					link, ok := links[*body.Handle]
+					link, ok := s.links[*body.Handle]
 					if !ok {
 						continue
 					}
@@ -670,13 +844,13 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				// attach frame.
 				//
 				// Note body.Role is the remote peer's role, we reverse for the local key.
-				link, linkOk := linksByKey[linkKey{name: body.Name, role: !body.Role}]
+				link, linkOk := s.linksByKey[linkKey{name: body.Name, role: !body.Role}]
 				if !linkOk {
 					break
 				}
 
 				link.remoteHandle = body.Handle
-				links[link.remoteHandle] = link
+				s.links[link.remoteHandle] = link
 
 				s.muxFrameToLink(link, fr.body)
 
@@ -688,7 +862,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				// (depending on policy) decrement its incoming-window."
 				nextIncomingID++
 				remoteOutgoingWindow--
-				link, ok := links[body.Handle]
+				link, ok := s.links[body.Handle]
 				if !ok {
 					continue
 				}
@@ -700,7 +874,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
 				if !body.Settled && body.DeliveryID != nil && link.receiverSettleMode != nil && *link.receiverSettleMode == ModeSecond {
-					handlesByRemoteDeliveryID[*body.DeliveryID] = body.Handle
+					s.handlesByRemoteDeliveryID[*body.DeliveryID] = body.Handle
 				}
 
 				// Update peer's outgoing window if half has been consumed.
@@ -718,7 +892,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				}
 
 			case *performDetach:
-				link, ok := links[body.Handle]
+				link, ok := s.links[body.Handle]
 				if !ok {
 					continue
 				}
@@ -739,27 +913,27 @@ func (s *Session) mux(remoteBegin *performBegin) {
 			var deliveryID uint32
 			if fr.DeliveryID != nil {
 				deliveryID = *fr.DeliveryID
-				deliveryIDByHandle[fr.Handle] = deliveryID
+				s.deliveryIDByHandle[fr.Handle] = deliveryID
 
 				// add to handleByDeliveryID if not sender-settled
 				if !fr.Settled {
-					handlesByDeliveryID[deliveryID] = fr.Handle
+					s.handlesByDeliveryID[deliveryID] = fr.Handle
 				}
 			} else {
 				// if fr.DeliveryID is nil it must have been added
 				// to deliveryIDByHandle already
-				deliveryID = deliveryIDByHandle[fr.Handle]
+				deliveryID = s.deliveryIDByHandle[fr.Handle]
 			}
 
 			// frame has been sender-settled, remove from map
 			if fr.Settled {
-				delete(handlesByDeliveryID, deliveryID)
+				delete(s.handlesByDeliveryID, deliveryID)
 			}
 
 			// if not settled, add done chan to map
 			// and clear from frame so conn doesn't close it.
 			if !fr.Settled && fr.done != nil {
-				settlementByDeliveryID[deliveryID] = fr.done
+				s.settlementByDeliveryID[deliveryID] = fr.done
 				fr.done = nil
 			}
 
@@ -1019,6 +1193,134 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 
 	return l, nil
 }
+
+// sendAttachLink is used by Receiver and Sender to create new links ... before session mux()
+func sendAttachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
+	l, err := newLink(s, r, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	isReceiver := r != nil
+
+	// buffer rx to linkCredit so that conn.mux won't block
+	// attempting to send to a slow reader
+	if isReceiver {
+		l.rx = make(chan frameBody, l.linkCredit)
+	} else {
+		l.rx = make(chan frameBody, 1)
+	}
+
+	// request handle from Session.mux
+	next, _ := s.handles.next()
+	l.handle = next         // allocate handle to the link
+	s.linksByKey[l.key] = l // add to mapping
+
+	attach := &performAttach{
+		Name:               l.key.name,
+		Handle:             l.handle,
+		ReceiverSettleMode: l.receiverSettleMode,
+		SenderSettleMode:   l.senderSettleMode,
+		MaxMessageSize:     l.maxMessageSize,
+		Source:             l.source,
+		Target:             l.target,
+		Properties:         l.properties,
+	}
+
+	if isReceiver {
+		attach.Role = roleReceiver
+		if attach.Source == nil {
+			attach.Source = new(source)
+		}
+		attach.Source.Dynamic = l.dynamicAddr
+	} else {
+		attach.Role = roleSender
+		if attach.Target == nil {
+			attach.Target = new(target)
+		}
+		attach.Target.Dynamic = l.dynamicAddr
+	}
+
+	// send Attach frame
+	debug(1, "TX: %s", attach)
+	s.addBatchTxFrames(attach, nil)
+
+	return l, nil
+}
+
+func waitForAttach(s *Session, l *link, isReceiver bool) (error) {
+	// wait for response
+	var fr frameBody
+	select {
+	case <-s.done:
+		return s.err
+	case fr = <-l.rx:
+	}
+	debug(3, "RX: %s", fr)
+	resp, ok := fr.(*performAttach)
+	if !ok {
+		return errorErrorf("unexpected attach response: %#v", fr)
+	}
+
+	if resp.Source == nil && resp.Target == nil {
+		// wait for detach
+		select {
+		case <-s.done:
+			return s.err
+		case fr = <-l.rx:
+		}
+
+		detach, ok := fr.(*performDetach)
+		if !ok {
+			return errorErrorf("unexpected frame while waiting for detach: %#v", fr)
+		}
+
+		// send return detach
+		fr = &performDetach{
+			Handle: l.handle,
+			Closed: true,
+		}
+		debug(1, "TX: %s", fr)
+		s.txFrame(fr, nil)
+
+		if detach.Error == nil {
+			return errorErrorf("received detach with no error specified")
+		}
+		return detach.Error
+	}
+
+	if l.maxMessageSize == 0 || resp.MaxMessageSize < l.maxMessageSize {
+		l.maxMessageSize = resp.MaxMessageSize
+	}
+
+	if isReceiver {
+		// if dynamic address requested, copy assigned name to address
+		if l.dynamicAddr && resp.Source != nil {
+			l.source.Address = resp.Source.Address
+		}
+		// deliveryCount is a sequence number, must initialize to sender's initial sequence number
+		l.deliveryCount = resp.InitialDeliveryCount
+		// buffer receiver so that link.mux doesn't block
+		l.messages = make(chan Message, l.receiver.maxCredit)
+	} else {
+		// if dynamic address requested, copy assigned name to address
+		if l.dynamicAddr && resp.Target != nil {
+			l.target.Address = resp.Target.Address
+		}
+		l.transfers = make(chan performTransfer)
+	}
+
+	err := l.setSettleModes(resp)
+	if err != nil {
+		l.muxDetach()
+		return err
+	}
+
+	go l.mux()
+
+	return nil
+}
+
 
 // setSettleModes sets the settlement modes based on the resp performAttach.
 //
